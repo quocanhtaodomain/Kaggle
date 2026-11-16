@@ -8,7 +8,7 @@
 # Usage: ./KaggleStream.sh [help|install|start|restart|stop|status|log]
 # ============================================
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 LOG_FILE="/var/log/kagglestream.log"
 PID_DIR="/var/run/kagglestream"
 
@@ -36,6 +36,7 @@ msg() {
             inst_update)        echo "Đang cập nhật hệ thống..." ;;
             inst_deps)          echo "Đang cài đặt thư viện phụ thuộc..." ;;
             inst_user)          echo "Đang tạo người dùng $GAMER_USER..." ;;
+            inst_rust)          echo "Đang cài đặt Rust + Cargo..." ;;
             inst_nvidia)        echo "Đang cài đặt NVIDIA Driver cho Tesla T4..." ;;
             inst_virtualgl)     echo "Đang cài đặt VirtualGL + OpenGL + Vulkan..." ;;
             inst_desktop)       echo "Đang cài đặt Openbox + LXDE Panel..." ;;
@@ -54,6 +55,7 @@ msg() {
             start_openbox)      echo "Khởi động Openbox..." ;;
             start_sunshine)     echo "Khởi động Sunshine..." ;;
             start_moonlight)    echo "Khởi động Moonlight Web Stream..." ;;
+            start_wait_port)    echo "Đang chờ port sẵn sàng..." ;;
             start_tunnels)      echo "Khởi động Cloudflare Tunnels..." ;;
             start_done)         echo "Môi trường đã sẵn sàng!" ;;
             stop_begin)         echo "Đang dừng tất cả dịch vụ..." ;;
@@ -66,6 +68,7 @@ msg() {
             err_noroot)         echo "Lỗi: Cần quyền root để cài đặt." ;;
             warn_nvidia)        echo "Cảnh báo: nvidia-smi thất bại. GPU có thể chưa được mount." ;;
             warn_sysctl)        echo "Cảnh báo: Không thể áp dụng sysctl (bình thường trong container)." ;;
+            warn_port_timeout)  echo "Cảnh báo: Port chưa mở sau khi chờ, tiếp tục..." ;;
             log_title)          echo "Nhật ký hệ thống" ;;
             log_sunshine)       echo "Log Sunshine" ;;
             log_moonlight)      echo "Log Moonlight" ;;
@@ -95,6 +98,7 @@ msg() {
             inst_update)        echo "Updating system packages..." ;;
             inst_deps)          echo "Installing dependencies..." ;;
             inst_user)          echo "Creating user $GAMER_USER..." ;;
+            inst_rust)          echo "Installing Rust + Cargo..." ;;
             inst_nvidia)        echo "Installing NVIDIA Driver for Tesla T4..." ;;
             inst_virtualgl)     echo "Installing VirtualGL + OpenGL + Vulkan..." ;;
             inst_desktop)       echo "Installing Openbox + LXDE Panel..." ;;
@@ -106,13 +110,14 @@ msg() {
             inst_optimize)      echo "Optimizing system for gaming..." ;;
             inst_cleartext)     echo "Configuring log hiding..." ;;
             inst_done)          echo "Installation complete! Run: ./KaggleStream.sh start" ;;
-            inst_already)        echo "Already installed. Use --force to reinstall." ;;
+            inst_already)       echo "Already installed. Use --force to reinstall." ;;
             start_begin)        echo "Starting gaming environment..." ;;
             start_pulse)        echo "Starting PulseAudio..." ;;
             start_xserver)      echo "Starting X Server (VNC)..." ;;
             start_openbox)      echo "Starting Openbox..." ;;
             start_sunshine)     echo "Starting Sunshine..." ;;
             start_moonlight)    echo "Starting Moonlight Web Stream..." ;;
+            start_wait_port)    echo "Waiting for ports to be ready..." ;;
             start_tunnels)      echo "Starting Cloudflare Tunnels..." ;;
             start_done)         echo "Environment is ready!" ;;
             stop_begin)         echo "Stopping all services..." ;;
@@ -125,6 +130,7 @@ msg() {
             err_noroot)         echo "Error: Root privileges required for installation." ;;
             warn_nvidia)        echo "Warning: nvidia-smi failed. GPU may not be mounted." ;;
             warn_sysctl)        echo "Warning: Cannot apply sysctl (normal in container)." ;;
+            warn_port_timeout)  echo "Warning: Port not open after waiting, continuing..." ;;
             log_title)          echo "System Logs" ;;
             log_sunshine)       echo "Sunshine Log" ;;
             log_moonlight)      echo "Moonlight Log" ;;
@@ -168,7 +174,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"; }
 section() { echo -e "\n${BOLD}${CYAN}>>> $* ${NC}" | tee -a "$LOG_FILE"; }
 
 mkdir -p "$PID_DIR"
-mkdir -p "$(dirname $LOG_FILE)"
+mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 
 check_root() {
@@ -211,47 +217,69 @@ service_status() {
     fi
 }
 
+# Wait for a TCP port to open, with timeout
+# Usage: wait_for_port <port> <timeout_seconds>
+wait_for_port() {
+    local port="$1"
+    local timeout="${2:-30}"
+    local elapsed=0
+    info "$(msg start_wait_port) (port $port, max ${timeout}s)..."
+    while ! (echo > /dev/tcp/127.0.0.1/"$port") 2>/dev/null; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if [ "$elapsed" -ge "$timeout" ]; then
+            warn "$(msg warn_port_timeout) (port $port)"
+            return 1
+        fi
+    done
+    ok "Port $port is ready (${elapsed}s)"
+    return 0
+}
+
+# Extract cloudflare tunnel URL from log, with retry
+# Usage: get_tunnel_url <logfile> <timeout_seconds>
+get_tunnel_url() {
+    local logfile="$1"
+    local timeout="${2:-30}"
+    local elapsed=0
+    local url=""
+    while [ -z "$url" ]; do
+        url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$logfile" 2>/dev/null | head -1)
+        [ -n "$url" ] && echo "$url" && return 0
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if [ "$elapsed" -ge "$timeout" ]; then
+            return 1
+        fi
+    done
+}
+
 # ============================================
 # LOG HIDING / CLEANUP
 # ============================================
 
 clear_logs() {
-    # Clear auth logs
-    cat /dev/null > /var/log/auth.log 2>/dev/null || true
-    cat /dev/null > /var/log/syslog 2>/dev/null || true
-    cat /dev/null > /var/log/daemon.log 2>/dev/null || true
-    cat /dev/null > /var/log/kern.log 2>/dev/null || true
-    cat /dev/null > /var/log/wtmp 2>/dev/null || true
-    cat /dev/null > /var/log/btmp 2>/dev/null || true
-    cat /dev/null > /var/log/lastlog 2>/dev/null || true
-
-    # Clear journald if available
+    for f in /var/log/auth.log /var/log/syslog /var/log/daemon.log \
+              /var/log/kern.log /var/log/wtmp /var/log/btmp /var/log/lastlog; do
+        cat /dev/null > "$f" 2>/dev/null || true
+    done
     if command -v journalctl &>/dev/null; then
         journalctl --rotate 2>/dev/null || true
         journalctl --vacuum-time=1s 2>/dev/null || true
     fi
-
-    # Clear history files
-    cat /dev/null > /root/.bash_history 2>/dev/null || true
-    cat /dev/null > /root/.python_history 2>/dev/null || true
-    cat /dev/null > /home/${GAMER_USER}/.bash_history 2>/dev/null || true
-    cat /dev/null > /home/${GAMER_USER}/.python_history 2>/dev/null || true
-
-    # Clear vim history
-    cat /dev/null > /root/.viminfo 2>/dev/null || true
-    cat /dev/null > /home/${GAMER_USER}/.viminfo 2>/dev/null || true
-
-    # Remove .lesshst
-    rm -f /root/.lesshst /home/${GAMER_USER}/.lesshst 2>/dev/null || true
-
-    # Clear kagglestream own log
+    for f in /root/.bash_history /root/.python_history /root/.viminfo \
+              "/home/${GAMER_USER}/.bash_history" \
+              "/home/${GAMER_USER}/.python_history" \
+              "/home/${GAMER_USER}/.viminfo"; do
+        cat /dev/null > "$f" 2>/dev/null || true
+    done
+    rm -f /root/.lesshst "/home/${GAMER_USER}/.lesshst" 2>/dev/null || true
     cat /dev/null > "$LOG_FILE" 2>/dev/null || true
 }
 
 setup_log_hiding() {
-    # Disable bash history for root and gamer user
-    for user_home in /root /home/${GAMER_USER}; do
-        # Disable bash history
+    for user_home in /root "/home/${GAMER_USER}"; do
+        grep -q 'HISTFILE=/dev/null' "$user_home/.bashrc" 2>/dev/null || \
         cat >> "$user_home/.bashrc" << 'HISTEOF'
 
 # Disable history logging
@@ -261,7 +289,7 @@ export HISTFILESIZE=0
 unset HISTFILE
 HISTEOF
 
-        # Disable history in .bash_profile too
+        grep -q 'HISTFILE=/dev/null' "$user_home/.bash_profile" 2>/dev/null || \
         cat >> "$user_home/.bash_profile" 2>/dev/null << 'PROFEOF'
 export HISTFILE=/dev/null
 export HISTSIZE=0
@@ -269,7 +297,6 @@ export HISTFILESIZE=0
 PROFEOF
     done
 
-    # Configure logrotate to keep logs minimal
     cat > /etc/logrotate.d/kagglestream-hide << 'LREOF'
 /var/log/auth.log {
     daily
@@ -287,13 +314,10 @@ PROFEOF
 }
 LREOF
 
-    # If rsyslog exists, reduce logging
     if [ -f /etc/rsyslog.conf ]; then
-        # Comment out auth logging lines
         sed -i 's/^[^#].*auth\./#&/' /etc/rsyslog.conf 2>/dev/null || true
     fi
 
-    # Clear current logs
     clear_logs
 }
 
@@ -302,43 +326,29 @@ LREOF
 # ============================================
 
 create_gamer_user() {
-    # Create user with home directory
     if id "$GAMER_USER" &>/dev/null; then
-        # User exists - reset password
         echo "${GAMER_USER}:${GAMER_PASS}" | chpasswd
     else
         useradd -m -s /bin/bash "$GAMER_USER"
         echo "${GAMER_USER}:${GAMER_PASS}" | chpasswd
     fi
 
-    # Add to sudo group
-    usermod -aG sudo "$GAMER_USER" 2>/dev/null || true
-    usermod -aG adm "$GAMER_USER" 2>/dev/null || true
-    usermod -aG video "$GAMER_USER" 2>/dev/null || true
-    usermod -aG render "$GAMER_USER" 2>/dev/null || true
-    usermod -aG audio "$GAMER_USER" 2>/dev/null || true
-    usermod -aG dialout "$GAMER_USER" 2>/dev/null || true
+    usermod -aG sudo,adm,video,render,audio,dialout "$GAMER_USER" 2>/dev/null || true
+    echo "${GAMER_USER} ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/${GAMER_USER}"
+    chmod 440 "/etc/sudoers.d/${GAMER_USER}"
 
-    # Passwordless sudo
-    echo "${GAMER_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${GAMER_USER}
-    chmod 440 /etc/sudoers.d/${GAMER_USER}
+    mkdir -p "/home/${GAMER_USER}/.config/openbox"
+    cp /root/.config/openbox/autostart "/home/${GAMER_USER}/.config/openbox/autostart" 2>/dev/null || true
 
-    # Copy openbox config to gamer home
-    mkdir -p /home/${GAMER_USER}/.config/openbox
-    cp /root/.config/openbox/autostart /home/${GAMER_USER}/.config/openbox/autostart 2>/dev/null || true
-
-    # Copy xinitrc
-    cat > /home/${GAMER_USER}/.xinitrc << 'EOF'
+    cat > "/home/${GAMER_USER}/.xinitrc" << 'EOF'
 #!/bin/bash
 export DISPLAY=:0
 export VGL_DISPLAY=:0
 exec openbox-session
 EOF
-    chmod +x /home/${GAMER_USER}/.xinitrc
-    chown ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.xinitrc
-
-    # Fix ownership
-    chown -R ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.config 2>/dev/null || true
+    chmod +x "/home/${GAMER_USER}/.xinitrc"
+    chown -R "${GAMER_USER}:${GAMER_USER}" "/home/${GAMER_USER}/.config" \
+        "/home/${GAMER_USER}/.xinitrc" 2>/dev/null || true
 }
 
 # ============================================
@@ -413,12 +423,31 @@ cmd_install() {
         libglu1-mesa libgl1-mesa-dri libglx-mesa0 \
         libgles2-mesa libgl1-mesa-glx \
         libxcb1 libxcb-glx0 libxcb-dri2-0 libxcb-dri3-0 \
-        libxrender1 libxi6 libxext6
+        libxrender1 libxi6 libxext6 \
+        pkg-config libssl-dev
     ok "$(msg inst_deps)"
+
+    # --- Rust + Cargo (required by moonlight-web-stream) ---
+    section "$(msg inst_rust)"
+    if ! command -v cargo &>/dev/null; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path
+        # Make cargo available system-wide for this session and future ones
+        export PATH="/root/.cargo/bin:$PATH"
+        echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc
+        echo 'export PATH="/root/.cargo/bin:$PATH"' >> /etc/environment
+    else
+        export PATH="/root/.cargo/bin:$PATH"
+    fi
+    # Verify
+    cargo --version
+    ok "$(msg inst_rust)"
 
     # --- Create Gamer User ---
     section "$(msg inst_user)"
     create_gamer_user
+    # Also give gamer user Rust/cargo access
+    echo 'export PATH="/root/.cargo/bin:$PATH"' >> "/home/${GAMER_USER}/.bashrc" 2>/dev/null || true
     ok "$(msg inst_user) ($GAMER_USER / $GAMER_PASS)"
 
     # --- NVIDIA Driver ---
@@ -439,9 +468,9 @@ cmd_install() {
 
     # --- VirtualGL + OpenGL + Vulkan ---
     section "$(msg inst_virtualgl)"
-
     VGLVER="3.1.1"
-    wget -q "https://github.com/VirtualGL/virtualgl/releases/download/${VGLVER}/virtualgl_${VGLVER}_amd64.deb" -O /tmp/virtualgl.deb
+    wget -q "https://github.com/VirtualGL/virtualgl/releases/download/${VGLVER}/virtualgl_${VGLVER}_amd64.deb" \
+        -O /tmp/virtualgl.deb
     dpkg -i /tmp/virtualgl.deb
     rm /tmp/virtualgl.deb
 
@@ -461,9 +490,7 @@ cmd_install() {
         vulkan-validationlayers
 
     apt-get install -y -qq libnvidia-gl-535 || true
-
     /opt/VirtualGL/bin/vglserver_config -config +s +f -t || true
-
     ok "$(msg inst_virtualgl)"
 
     # --- Openbox + LXDE Panel ---
@@ -493,10 +520,9 @@ exec openbox-session
 EOF
     chmod +x /root/.xinitrc
 
-    # Copy config to gamer user
-    mkdir -p /home/${GAMER_USER}/.config/openbox
-    cp /root/.config/openbox/autostart /home/${GAMER_USER}/.config/openbox/autostart
-    chown -R ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.config
+    mkdir -p "/home/${GAMER_USER}/.config/openbox"
+    cp /root/.config/openbox/autostart "/home/${GAMER_USER}/.config/openbox/autostart"
+    chown -R "${GAMER_USER}:${GAMER_USER}" "/home/${GAMER_USER}/.config"
     ok "$(msg inst_desktop)"
 
     # --- Chromium ---
@@ -507,7 +533,8 @@ EOF
     # --- Sunshine ---
     section "$(msg inst_sunshine)"
     SUNSHINE_VER="v0.23.1"
-    wget -q "https://github.com/LizardByte/Sunshine/releases/download/${SUNSHINE_VER}/sunshine-ubuntu-22.04-amd64.deb" -O /tmp/sunshine.deb
+    wget -q "https://github.com/LizardByte/Sunshine/releases/download/${SUNSHINE_VER}/sunshine-ubuntu-22.04-amd64.deb" \
+        -O /tmp/sunshine.deb
     apt-get install -y -qq /tmp/sunshine.deb
     rm /tmp/sunshine.deb
 
@@ -527,26 +554,34 @@ nvenc_vbv_increase = 0
 min_log_level      = info
 EOF
 
-    # Copy Sunshine config to gamer user
-    mkdir -p /home/${GAMER_USER}/.config/sunshine
-    cp /root/.config/sunshine/sunshine.conf /home/${GAMER_USER}/.config/sunshine/sunshine.conf
-    chown -R ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.config/sunshine
+    mkdir -p "/home/${GAMER_USER}/.config/sunshine"
+    cp /root/.config/sunshine/sunshine.conf "/home/${GAMER_USER}/.config/sunshine/sunshine.conf"
+    chown -R "${GAMER_USER}:${GAMER_USER}" "/home/${GAMER_USER}/.config/sunshine"
     ok "$(msg inst_sunshine)"
 
     # --- Moonlight Web Stream ---
     section "$(msg inst_moonlight)"
+
+    # Node.js 20
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - > /dev/null 2>&1
     apt-get install -y -qq nodejs
 
-    mkdir -p /opt
+    # Clone / update repo
     if [ -d /opt/moonlight-web-stream ]; then
-        git -C /opt/moonlight-web-stream pull
+        git -C /opt/moonlight-web-stream pull -q
     else
-        git clone -q https://github.com/MrCreativ3001/moonlight-web-stream.git /opt/moonlight-web-stream
+        git clone -q https://github.com/MrCreativ3001/moonlight-web-stream.git \
+            /opt/moonlight-web-stream
     fi
+
     cd /opt/moonlight-web-stream
-    npm install --silent
-    npm run build --silent
+
+    # Ensure cargo is on PATH for npm scripts that invoke Rust
+    export PATH="/root/.cargo/bin:$PATH"
+
+    npm install
+    npm run build
+
     ok "$(msg inst_moonlight)"
 
     # --- PolyMC ---
@@ -562,7 +597,8 @@ EOF
 
     # --- Cloudflare Tunnel ---
     section "$(msg inst_cloudflare)"
-    wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -O /tmp/cloudflared.deb
+    wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+        -O /tmp/cloudflared.deb
     dpkg -i /tmp/cloudflared.deb
     rm /tmp/cloudflared.deb
     ok "$(msg inst_cloudflare)"
@@ -574,7 +610,7 @@ EOF
         echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null || true
     fi
 
-    cat >> /etc/sysctl.d/99-kagglestream.conf << 'EOF'
+    cat > /etc/sysctl.d/99-kagglestream.conf << 'EOF'
 vm.swappiness = 10
 vm.dirty_ratio = 15
 vm.dirty_background_ratio = 5
@@ -636,6 +672,9 @@ cmd_start() {
         exit 1
     fi
 
+    # Ensure cargo on PATH in case it was installed during setup
+    export PATH="/root/.cargo/bin:$PATH"
+
     section "$(msg start_begin)"
 
     # PulseAudio
@@ -648,7 +687,7 @@ cmd_start() {
         Xtigervnc :0 -screen 0 1920x1080x24 -SecurityTypes None \
             -rfbport 5900 > /tmp/kagglestream-xvnc.log 2>&1 &
         save_pid "xvnc" $!
-        sleep 3
+        wait_for_port 5900 20
     fi
     export DISPLAY=:0
 
@@ -665,7 +704,8 @@ cmd_start() {
     if ! get_pid "sunshine" > /dev/null 2>&1; then
         DISPLAY=:0 VGL_DISPLAY=:0 sunshine > /tmp/kagglestream-sunshine.log 2>&1 &
         save_pid "sunshine" $!
-        sleep 3
+        # Wait until Sunshine web UI port is actually open
+        wait_for_port 47990 30
     fi
 
     # Moonlight Web Stream
@@ -674,10 +714,11 @@ cmd_start() {
         cd /opt/moonlight-web-stream
         npm run start > /tmp/kagglestream-moonlight.log 2>&1 &
         save_pid "moonlight" $!
-        sleep 3
+        # Wait until Moonlight port is actually open
+        wait_for_port 3000 30
     fi
 
-    # Cloudflare Tunnels
+    # Cloudflare Tunnels — start only after ports are confirmed open
     section "$(msg start_tunnels)"
 
     if ! get_pid "tunnel-sunshine" > /dev/null 2>&1; then
@@ -692,12 +733,11 @@ cmd_start() {
         save_pid "tunnel-moonlight" $!
     fi
 
-    sleep 5
+    # Wait for tunnel URLs to appear in logs (up to 30s each)
+    info "Waiting for Cloudflare tunnel URLs..."
     local url_sunshine url_moonlight
-    url_sunshine=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' \
-        /tmp/kagglestream-tunnel-sunshine.log 2>/dev/null | head -1)
-    url_moonlight=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' \
-        /tmp/kagglestream-tunnel-moonlight.log 2>/dev/null | head -1)
+    url_sunshine=$(get_tunnel_url /tmp/kagglestream-tunnel-sunshine.log 30) || true
+    url_moonlight=$(get_tunnel_url /tmp/kagglestream-tunnel-moonlight.log 30) || true
 
     echo ""
     echo -e "${BOLD}${GREEN}====================================${NC}"
@@ -710,16 +750,16 @@ cmd_start() {
     if [ -n "$url_sunshine" ]; then
         echo -e "  ${GREEN}Sunshine  Tunnel:${NC} $url_sunshine"
     else
-        echo -e "  ${YELLOW}Sunshine  Tunnel:${NC} (generating... check: ./KaggleStream.sh log)"
+        echo -e "  ${YELLOW}Sunshine  Tunnel:${NC} (timeout - check: ./KaggleStream.sh log)"
     fi
     if [ -n "$url_moonlight" ]; then
         echo -e "  ${GREEN}Moonlight Tunnel:${NC} $url_moonlight"
     else
-        echo -e "  ${YELLOW}Moonlight Tunnel:${NC} (generating... check: ./KaggleStream.sh log)"
+        echo -e "  ${YELLOW}Moonlight Tunnel:${NC} (timeout - check: ./KaggleStream.sh log)"
     fi
     echo ""
 
-    # Clear logs after start
+    # Clear logs after start to hide traces
     clear_logs
 }
 
@@ -742,8 +782,6 @@ cmd_stop() {
     pkill -f "openbox" 2>/dev/null || true
     pkill -f "Xtigervnc" 2>/dev/null || true
     ok "$(msg stop_done)"
-
-    # Clear logs after stop
     clear_logs
 }
 
@@ -769,24 +807,22 @@ cmd_status() {
     printf "  %-22s %s\n" "X Server (VNC)"        "$(service_status xvnc)"
     printf "  %-22s %s\n" "Openbox"               "$(service_status openbox)"
     printf "  %-22s %s\n" "Sunshine"              "$(service_status sunshine)"
-    printf "  %-22s %s\n" "Moonlight Web Stream" "$(service_status moonlight)"
+    printf "  %-22s %s\n" "Moonlight Web Stream"  "$(service_status moonlight)"
     printf "  %-22s %s\n" "Tunnel (Sunshine)"     "$(service_status tunnel-sunshine)"
     printf "  %-22s %s\n" "Tunnel (Moonlight)"    "$(service_status tunnel-moonlight)"
     echo "  ─────────────────────────────────────"
     echo ""
 
-    # GPU status
     echo -e "  ${BOLD}GPU:${NC}"
     if command -v nvidia-smi &>/dev/null; then
         nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total \
             --format=csv,noheader,nounits 2>/dev/null | \
-            awk -F',' '{printf "  %-20s Temp:%s°C  GPU:%s%%  VRAM:%s%%  Mem:%sMB/%sMB\n",$1,$2,$3,$5,$6,$7}' \
+            awk -F',' '{printf "  %-20s Temp:%s°C  GPU:%s%%  Mem:%sMB/%sMB\n",$1,$2,$3,$5,$6}' \
             || echo "  nvidia-smi unavailable"
     else
         echo "  NVIDIA driver not found"
     fi
 
-    # Tunnel URLs
     echo ""
     echo -e "  ${BOLD}Cloudflare Tunnels:${NC}"
     local url_sun url_moon
@@ -822,7 +858,7 @@ cmd_log() {
     tail -n "$lines" /tmp/kagglestream-tunnel-moonlight.log 2>/dev/null || echo "(no log)"
 
     echo ""
-    echo -e "${BOLD}${CYAN}=== $(msg log_title) (kagglestream) ===${NC}"
+    echo -e "${BOLD}${CYAN}=== $(msg log_title) ===${NC}"
     tail -n "$lines" "$LOG_FILE" 2>/dev/null || echo "(no log)"
 }
 
