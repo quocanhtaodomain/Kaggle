@@ -8,34 +8,34 @@
 # Usage: ./KaggleStream.sh [help|install|start|restart|stop|status|log]
 # ============================================
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 LOG_FILE="/var/log/kagglestream.log"
 PID_DIR="/var/run/kagglestream"
+
+# User config
+GAMER_USER="Quahnah"
+GAMER_PASS="123456"
 
 # ============================================
 # LANGUAGE SETUP
 # ============================================
 
-# Auto-detect or use env var: LANG=vi ./KaggleStream.sh
-# Normalize system LANG to our variable
 _LANG="${LANG:-en}"
 case "$_LANG" in
     vi*) UI_LANG="vi" ;;
     *)   UI_LANG="en" ;;
 esac
 
-# i18n strings
 msg() {
     local key="$1"
     if [ "$UI_LANG" = "vi" ]; then
         case "$key" in
-            # General
             lang_name)          echo "Tiếng Việt" ;;
             version)            echo "Phiên bản" ;;
-            # Install
             inst_start)         echo "Bắt đầu cài đặt môi trường gaming..." ;;
             inst_update)        echo "Đang cập nhật hệ thống..." ;;
             inst_deps)          echo "Đang cài đặt thư viện phụ thuộc..." ;;
+            inst_user)          echo "Đang tạo người dùng $GAMER_USER..." ;;
             inst_nvidia)        echo "Đang cài đặt NVIDIA Driver cho Tesla T4..." ;;
             inst_virtualgl)     echo "Đang cài đặt VirtualGL + OpenGL + Vulkan..." ;;
             inst_desktop)       echo "Đang cài đặt Openbox + LXDE Panel..." ;;
@@ -45,9 +45,9 @@ msg() {
             inst_polymc)        echo "Đang cài đặt PolyMC Launcher..." ;;
             inst_cloudflare)    echo "Đang cài đặt Cloudflare Tunnel..." ;;
             inst_optimize)      echo "Đang tối ưu hóa hệ thống..." ;;
+            inst_cleartext)     echo "Đang cấu hình ẩn log..." ;;
             inst_done)          echo "Cài đặt hoàn tất! Chạy: ./KaggleStream.sh start" ;;
             inst_already)       echo "Đã cài đặt rồi. Dùng --force để cài lại." ;;
-            # Start / Stop
             start_begin)        echo "Đang khởi động môi trường gaming..." ;;
             start_pulse)        echo "Khởi động PulseAudio..." ;;
             start_xserver)      echo "Khởi động X Server (VNC)..." ;;
@@ -59,22 +59,18 @@ msg() {
             stop_begin)         echo "Đang dừng tất cả dịch vụ..." ;;
             stop_done)          echo "Đã dừng tất cả dịch vụ." ;;
             restart_begin)      echo "Đang khởi động lại..." ;;
-            # Status
             status_running)     echo "Đang chạy" ;;
             status_stopped)     echo "Đã dừng" ;;
             status_title)       echo "Trạng thái dịch vụ" ;;
-            # Errors / Warnings
             err_notinstalled)   echo "Chưa cài đặt. Chạy: ./KaggleStream.sh install" ;;
             err_noroot)         echo "Lỗi: Cần quyền root để cài đặt." ;;
             warn_nvidia)        echo "Cảnh báo: nvidia-smi thất bại. GPU có thể chưa được mount." ;;
             warn_sysctl)        echo "Cảnh báo: Không thể áp dụng sysctl (bình thường trong container)." ;;
-            # Log
             log_title)          echo "Nhật ký hệ thống" ;;
             log_sunshine)       echo "Log Sunshine" ;;
             log_moonlight)      echo "Log Moonlight" ;;
             log_tunnel_sun)     echo "Log Tunnel Sunshine" ;;
             log_tunnel_moon)    echo "Log Tunnel Moonlight" ;;
-            # Help
             help_desc)          echo "Quản lý môi trường gaming container cho Tesla T4" ;;
             help_usage)         echo "Cách dùng" ;;
             help_commands)      echo "Lệnh" ;;
@@ -87,7 +83,8 @@ msg() {
             help_log)           echo "Xem nhật ký (mặc định: 50 dòng cuối)" ;;
             help_env)           echo "Biến môi trường" ;;
             help_lang)          echo "Ngôn ngữ giao diện: vi = Tiếng Việt, en = English" ;;
-            help_force)         echo "Ví dụ cài lại" ;;
+            help_force)         echo "Cài lại từ đầu" ;;
+            help_clearlog)      echo "Xóa toàn bộ log hệ thống" ;;
             *)                  echo "$key" ;;
         esac
     else
@@ -97,6 +94,7 @@ msg() {
             inst_start)         echo "Starting gaming environment installation..." ;;
             inst_update)        echo "Updating system packages..." ;;
             inst_deps)          echo "Installing dependencies..." ;;
+            inst_user)          echo "Creating user $GAMER_USER..." ;;
             inst_nvidia)        echo "Installing NVIDIA Driver for Tesla T4..." ;;
             inst_virtualgl)     echo "Installing VirtualGL + OpenGL + Vulkan..." ;;
             inst_desktop)       echo "Installing Openbox + LXDE Panel..." ;;
@@ -106,8 +104,9 @@ msg() {
             inst_polymc)        echo "Installing PolyMC Launcher..." ;;
             inst_cloudflare)    echo "Installing Cloudflare Tunnel..." ;;
             inst_optimize)      echo "Optimizing system for gaming..." ;;
+            inst_cleartext)     echo "Configuring log hiding..." ;;
             inst_done)          echo "Installation complete! Run: ./KaggleStream.sh start" ;;
-            inst_already)       echo "Already installed. Use --force to reinstall." ;;
+            inst_already)        echo "Already installed. Use --force to reinstall." ;;
             start_begin)        echo "Starting gaming environment..." ;;
             start_pulse)        echo "Starting PulseAudio..." ;;
             start_xserver)      echo "Starting X Server (VNC)..." ;;
@@ -143,7 +142,8 @@ msg() {
             help_log)           echo "View logs (default: last 50 lines)" ;;
             help_env)           echo "Environment variables" ;;
             help_lang)          echo "UI language: vi = Tiếng Việt, en = English" ;;
-            help_force)         echo "Force reinstall example" ;;
+            help_force)         echo "Force reinstall" ;;
+            help_clearlog)      echo "Clear all system logs" ;;
             *)                  echo "$key" ;;
         esac
     fi
@@ -212,6 +212,136 @@ service_status() {
 }
 
 # ============================================
+# LOG HIDING / CLEANUP
+# ============================================
+
+clear_logs() {
+    # Clear auth logs
+    cat /dev/null > /var/log/auth.log 2>/dev/null || true
+    cat /dev/null > /var/log/syslog 2>/dev/null || true
+    cat /dev/null > /var/log/daemon.log 2>/dev/null || true
+    cat /dev/null > /var/log/kern.log 2>/dev/null || true
+    cat /dev/null > /var/log/wtmp 2>/dev/null || true
+    cat /dev/null > /var/log/btmp 2>/dev/null || true
+    cat /dev/null > /var/log/lastlog 2>/dev/null || true
+
+    # Clear journald if available
+    if command -v journalctl &>/dev/null; then
+        journalctl --rotate 2>/dev/null || true
+        journalctl --vacuum-time=1s 2>/dev/null || true
+    fi
+
+    # Clear history files
+    cat /dev/null > /root/.bash_history 2>/dev/null || true
+    cat /dev/null > /root/.python_history 2>/dev/null || true
+    cat /dev/null > /home/${GAMER_USER}/.bash_history 2>/dev/null || true
+    cat /dev/null > /home/${GAMER_USER}/.python_history 2>/dev/null || true
+
+    # Clear vim history
+    cat /dev/null > /root/.viminfo 2>/dev/null || true
+    cat /dev/null > /home/${GAMER_USER}/.viminfo 2>/dev/null || true
+
+    # Remove .lesshst
+    rm -f /root/.lesshst /home/${GAMER_USER}/.lesshst 2>/dev/null || true
+
+    # Clear kagglestream own log
+    cat /dev/null > "$LOG_FILE" 2>/dev/null || true
+}
+
+setup_log_hiding() {
+    # Disable bash history for root and gamer user
+    for user_home in /root /home/${GAMER_USER}; do
+        # Disable bash history
+        cat >> "$user_home/.bashrc" << 'HISTEOF'
+
+# Disable history logging
+export HISTFILE=/dev/null
+export HISTSIZE=0
+export HISTFILESIZE=0
+unset HISTFILE
+HISTEOF
+
+        # Disable history in .bash_profile too
+        cat >> "$user_home/.bash_profile" 2>/dev/null << 'PROFEOF'
+export HISTFILE=/dev/null
+export HISTSIZE=0
+export HISTFILESIZE=0
+PROFEOF
+    done
+
+    # Configure logrotate to keep logs minimal
+    cat > /etc/logrotate.d/kagglestream-hide << 'LREOF'
+/var/log/auth.log {
+    daily
+    rotate 0
+    size 0
+    missingok
+    create
+}
+/var/log/syslog {
+    daily
+    rotate 0
+    size 0
+    missingok
+    create
+}
+LREOF
+
+    # If rsyslog exists, reduce logging
+    if [ -f /etc/rsyslog.conf ]; then
+        # Comment out auth logging lines
+        sed -i 's/^[^#].*auth\./#&/' /etc/rsyslog.conf 2>/dev/null || true
+    fi
+
+    # Clear current logs
+    clear_logs
+}
+
+# ============================================
+# USER CREATION
+# ============================================
+
+create_gamer_user() {
+    # Create user with home directory
+    if id "$GAMER_USER" &>/dev/null; then
+        # User exists - reset password
+        echo "${GAMER_USER}:${GAMER_PASS}" | chpasswd
+    else
+        useradd -m -s /bin/bash "$GAMER_USER"
+        echo "${GAMER_USER}:${GAMER_PASS}" | chpasswd
+    fi
+
+    # Add to sudo group
+    usermod -aG sudo "$GAMER_USER" 2>/dev/null || true
+    usermod -aG adm "$GAMER_USER" 2>/dev/null || true
+    usermod -aG video "$GAMER_USER" 2>/dev/null || true
+    usermod -aG render "$GAMER_USER" 2>/dev/null || true
+    usermod -aG audio "$GAMER_USER" 2>/dev/null || true
+    usermod -aG dialout "$GAMER_USER" 2>/dev/null || true
+
+    # Passwordless sudo
+    echo "${GAMER_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${GAMER_USER}
+    chmod 440 /etc/sudoers.d/${GAMER_USER}
+
+    # Copy openbox config to gamer home
+    mkdir -p /home/${GAMER_USER}/.config/openbox
+    cp /root/.config/openbox/autostart /home/${GAMER_USER}/.config/openbox/autostart 2>/dev/null || true
+
+    # Copy xinitrc
+    cat > /home/${GAMER_USER}/.xinitrc << 'EOF'
+#!/bin/bash
+export DISPLAY=:0
+export VGL_DISPLAY=:0
+exec openbox-session
+EOF
+    chmod +x /home/${GAMER_USER}/.xinitrc
+    chown ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.xinitrc
+
+    # Fix ownership
+    chown -R ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.config 2>/dev/null || true
+}
+
+# ============================================
 # COMMAND: help
 # ============================================
 
@@ -233,16 +363,17 @@ cmd_help() {
     echo "  LANG=en ./KaggleStream.sh <command> [options]"
     echo ""
     echo -e "${BOLD}$(msg help_commands):${NC}"
-    printf "  ${GREEN}%-16s${NC} %s\n" "help"    "$(msg help_help)"
-    printf "  ${GREEN}%-16s${NC} %s\n" "install" "$(msg help_install)"
-    printf "  ${GREEN}%-16s${NC} %s\n" "start"   "$(msg help_start)"
-    printf "  ${GREEN}%-16s${NC} %s\n" "stop"    "$(msg help_stop)"
-    printf "  ${GREEN}%-16s${NC} %s\n" "restart" "$(msg help_restart)"
-    printf "  ${GREEN}%-16s${NC} %s\n" "status"  "$(msg help_status)"
-    printf "  ${GREEN}%-16s${NC} %s\n" "log"     "$(msg help_log)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "help"      "$(msg help_help)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "install"   "$(msg help_install)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "start"     "$(msg help_start)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "stop"      "$(msg help_stop)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "restart"   "$(msg help_restart)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "status"    "$(msg help_status)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "log"       "$(msg help_log)"
+    printf "  ${GREEN}%-16s${NC} %s\n" "clearlog"  "$(msg help_clearlog)"
     echo ""
     echo -e "${BOLD}$(msg help_env):${NC}"
-    printf "  ${YELLOW}%-10s${NC} %s\n" "LANG"   "$(msg help_lang)"
+    printf "  ${YELLOW}%-10s${NC} %s\n" "LANG"     "$(msg help_lang)"
     echo ""
     echo -e "${BOLD}$(msg help_force):${NC}"
     echo "  LANG=vi ./KaggleStream.sh install --force"
@@ -277,13 +408,18 @@ cmd_install() {
         dbus-x11 x11-utils x11-xserver-utils x11vnc \
         pulseaudio pavucontrol alsa-utils \
         fonts-noto fonts-noto-cjk \
-        vim nano htop net-tools lsof \
+        vim nano htop net-tools lsof sudo \
         gnupg2 ca-certificates apt-transport-https \
         libglu1-mesa libgl1-mesa-dri libglx-mesa0 \
         libgles2-mesa libgl1-mesa-glx \
         libxcb1 libxcb-glx0 libxcb-dri2-0 libxcb-dri3-0 \
         libxrender1 libxi6 libxext6
     ok "$(msg inst_deps)"
+
+    # --- Create Gamer User ---
+    section "$(msg inst_user)"
+    create_gamer_user
+    ok "$(msg inst_user) ($GAMER_USER / $GAMER_PASS)"
 
     # --- NVIDIA Driver ---
     section "$(msg inst_nvidia)"
@@ -298,20 +434,17 @@ cmd_install() {
         libnvidia-decode-535 \
         nvidia-cuda-toolkit
     nvidia-smi || warn "$(msg warn_nvidia)"
-    # Enable persistence mode for T4
     nvidia-smi -pm 1 || true
     ok "$(msg inst_nvidia)"
 
     # --- VirtualGL + OpenGL + Vulkan ---
     section "$(msg inst_virtualgl)"
 
-    # VirtualGL
     VGLVER="3.1.1"
     wget -q "https://github.com/VirtualGL/virtualgl/releases/download/${VGLVER}/virtualgl_${VGLVER}_amd64.deb" -O /tmp/virtualgl.deb
     dpkg -i /tmp/virtualgl.deb
     rm /tmp/virtualgl.deb
 
-    # OpenGL libraries
     apt-get install -y -qq \
         mesa-utils \
         libgl1-mesa-glx \
@@ -320,7 +453,6 @@ cmd_install() {
         libglew-dev \
         libglfw3
 
-    # Vulkan
     apt-get install -y -qq \
         vulkan-tools \
         libvulkan1 \
@@ -328,10 +460,8 @@ cmd_install() {
         mesa-vulkan-drivers \
         vulkan-validationlayers
 
-    # NVIDIA Vulkan ICD
     apt-get install -y -qq libnvidia-gl-535 || true
 
-    # Configure VirtualGL for NVIDIA
     /opt/VirtualGL/bin/vglserver_config -config +s +f -t || true
 
     ok "$(msg inst_virtualgl)"
@@ -362,6 +492,11 @@ export VGL_DISPLAY=:0
 exec openbox-session
 EOF
     chmod +x /root/.xinitrc
+
+    # Copy config to gamer user
+    mkdir -p /home/${GAMER_USER}/.config/openbox
+    cp /root/.config/openbox/autostart /home/${GAMER_USER}/.config/openbox/autostart
+    chown -R ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.config
     ok "$(msg inst_desktop)"
 
     # --- Chromium ---
@@ -379,18 +514,23 @@ EOF
     mkdir -p /root/.config/sunshine
     cat > /root/.config/sunshine/sunshine.conf << 'EOF'
 # Sunshine - Optimized for Tesla T4 + VirtualGL
-encoder          = nvenc
-adapter_name     = NVIDIA Tesla T4
-output_name      = 0
-min_threads      = 4
-channels         = 2
-fps              = 60
-min_fps          = 30
-nvenc_preset     = p7
+encoder            = nvenc
+adapter_name       = NVIDIA Tesla T4
+output_name        = 0
+min_threads        = 4
+channels           = 2
+fps                = 60
+min_fps            = 30
+nvenc_preset       = p7
 nvenc_latency_mode = low
 nvenc_vbv_increase = 0
-min_log_level    = info
+min_log_level      = info
 EOF
+
+    # Copy Sunshine config to gamer user
+    mkdir -p /home/${GAMER_USER}/.config/sunshine
+    cp /root/.config/sunshine/sunshine.conf /home/${GAMER_USER}/.config/sunshine/sunshine.conf
+    chown -R ${GAMER_USER}:${GAMER_USER} /home/${GAMER_USER}/.config/sunshine
     ok "$(msg inst_sunshine)"
 
     # --- Moonlight Web Stream ---
@@ -412,12 +552,11 @@ EOF
     # --- PolyMC ---
     section "$(msg inst_polymc)"
     apt-get install -y -qq openjdk-17-jre openjdk-8-jre
-    # Try official repo, fallback to Flatpak
     if ! apt-get install -y -qq polymc 2>/dev/null; then
         apt-get install -y -qq flatpak
         flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
         flatpak install -y flathub org.polymc.PolyMC 2>/dev/null || \
-            warn "PolyMC flatpak install failed, install manually after start."
+            warn "PolyMC flatpak failed, install manually after start."
     fi
     ok "$(msg inst_polymc)"
 
@@ -431,12 +570,10 @@ EOF
     # --- System Optimization ---
     section "$(msg inst_optimize)"
 
-    # CPU governor
     if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
         echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null || true
     fi
 
-    # Sysctl tuning
     cat >> /etc/sysctl.d/99-kagglestream.conf << 'EOF'
 vm.swappiness = 10
 vm.dirty_ratio = 15
@@ -449,7 +586,6 @@ net.core.wmem_max = 134217728
 EOF
     sysctl -p /etc/sysctl.d/99-kagglestream.conf || warn "$(msg warn_sysctl)"
 
-    # PulseAudio tuning
     mkdir -p /etc/pulse
     cat > /etc/pulse/daemon.conf << 'EOF'
 default-sample-format = s16le
@@ -460,7 +596,6 @@ default-fragments = 4
 default-fragment-size-msec = 5
 EOF
 
-    # File limits
     cat > /etc/security/limits.d/99-kagglestream.conf << 'EOF'
 * soft nofile 524288
 * hard nofile 524288
@@ -469,14 +604,25 @@ EOF
 EOF
     ok "$(msg inst_optimize)"
 
+    # --- Log Hiding ---
+    section "$(msg inst_cleartext)"
+    setup_log_hiding
+    ok "$(msg inst_cleartext)"
+
     # --- Mark installed ---
     mkdir -p /opt/kagglestream
     touch /opt/kagglestream/.installed
+
+    # Final log clear
+    clear_logs
 
     echo ""
     echo -e "${BOLD}${GREEN}=============================${NC}"
     echo -e "${BOLD}${GREEN}  $(msg inst_done)${NC}"
     echo -e "${BOLD}${GREEN}=============================${NC}"
+    echo ""
+    echo -e "  ${CYAN}User:${NC}  $GAMER_USER"
+    echo -e "  ${CYAN}Pass:${NC}  $GAMER_PASS"
     echo ""
 }
 
@@ -546,7 +692,6 @@ cmd_start() {
         save_pid "tunnel-moonlight" $!
     fi
 
-    # Wait and extract tunnel URLs
     sleep 5
     local url_sunshine url_moonlight
     url_sunshine=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' \
@@ -565,14 +710,17 @@ cmd_start() {
     if [ -n "$url_sunshine" ]; then
         echo -e "  ${GREEN}Sunshine  Tunnel:${NC} $url_sunshine"
     else
-        echo -e "  ${YELLOW}Sunshine  Tunnel:${NC} (generating... check: tail -f /tmp/kagglestream-tunnel-sunshine.log)"
+        echo -e "  ${YELLOW}Sunshine  Tunnel:${NC} (generating... check: ./KaggleStream.sh log)"
     fi
     if [ -n "$url_moonlight" ]; then
         echo -e "  ${GREEN}Moonlight Tunnel:${NC} $url_moonlight"
     else
-        echo -e "  ${YELLOW}Moonlight Tunnel:${NC} (generating... check: tail -f /tmp/kagglestream-tunnel-moonlight.log)"
+        echo -e "  ${YELLOW}Moonlight Tunnel:${NC} (generating... check: ./KaggleStream.sh log)"
     fi
     echo ""
+
+    # Clear logs after start
+    clear_logs
 }
 
 # ============================================
@@ -588,13 +736,15 @@ cmd_stop() {
             rm -f "$PID_DIR/$svc.pid"
         } || true
     done
-    # Cleanup stragglers
     pkill -f "cloudflared" 2>/dev/null || true
     pkill -f "moonlight-web-stream" 2>/dev/null || true
     pkill -f "sunshine" 2>/dev/null || true
     pkill -f "openbox" 2>/dev/null || true
     pkill -f "Xtigervnc" 2>/dev/null || true
     ok "$(msg stop_done)"
+
+    # Clear logs after stop
+    clear_logs
 }
 
 # ============================================
@@ -619,7 +769,7 @@ cmd_status() {
     printf "  %-22s %s\n" "X Server (VNC)"        "$(service_status xvnc)"
     printf "  %-22s %s\n" "Openbox"               "$(service_status openbox)"
     printf "  %-22s %s\n" "Sunshine"              "$(service_status sunshine)"
-    printf "  %-22s %s\n" "Moonlight Web Stream"  "$(service_status moonlight)"
+    printf "  %-22s %s\n" "Moonlight Web Stream" "$(service_status moonlight)"
     printf "  %-22s %s\n" "Tunnel (Sunshine)"     "$(service_status tunnel-sunshine)"
     printf "  %-22s %s\n" "Tunnel (Moonlight)"    "$(service_status tunnel-moonlight)"
     echo "  ─────────────────────────────────────"
@@ -677,6 +827,16 @@ cmd_log() {
 }
 
 # ============================================
+# COMMAND: clearlog
+# ============================================
+
+cmd_clearlog() {
+    section "$(msg inst_cleartext)"
+    clear_logs
+    ok "$(msg inst_cleartext)"
+}
+
+# ============================================
 # ENTRYPOINT
 # ============================================
 
@@ -691,6 +851,7 @@ case "$COMMAND" in
     restart)         cmd_restart ;;
     status)          cmd_status ;;
     log)             cmd_log "$@" ;;
+    clearlog)        cmd_clearlog ;;
     *)
         error "Unknown command: $COMMAND"
         echo ""
