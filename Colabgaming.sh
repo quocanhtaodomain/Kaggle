@@ -44,7 +44,7 @@ WEB_PORT="${WEB_PORT:-6080}"
 CF_TOKEN="${CF_TOKEN:-}"
 CF_PROTOCOL="${CF_PROTOCOL:-http2}"
 VERBOSE="${VERBOSE:-0}"
-RD_USER="${RD_USER:-remote}"
+RD_USER="${RD_USER:-Quahnah}"
 RD_USER_PASSWORD="${RD_USER_PASSWORD:-quocanhh}"
 
 # ---------------------------------------------------------------------
