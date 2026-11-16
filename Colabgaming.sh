@@ -25,6 +25,7 @@
 #   WEB_PORT           cổng Moonlight Web trên localhost (mặc định 6080; tránh 8080 vì Colab dùng)
 #   SUNSHINE_USER      tài khoản web UI của Sunshine (mặc định: sunshine)
 #   SUNSHINE_PASSWORD  mật khẩu web UI của Sunshine (mặc định: quocanhh; lưu lại cho lần sau)
+#   SUNSHINE_WAIT      số giây chờ Sunshine sẵn sàng khi start (mặc định 45)
 #   SUNSHINE_VERSION   tag Sunshine, ví dụ v2026.914.233613 (mặc định: bản mới nhất)
 #   MOONLIGHT_VERSION  tag Moonlight Web, ví dụ v3.0.2 (mặc định: bản mới nhất)
 #   CF_PROTOCOL        giao thức cloudflared: http2 (mặc định) hoặc quic
@@ -127,7 +128,7 @@ reexec_as_user() {
 
   # Giữ lại các biến cấu hình và PATH (Colab có nvidia-smi ở thư mục riêng)
   envs="export PATH=$(printf '%q' "$PATH"):\$PATH; "
-  for v in RD_LANG_SET CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
+  for v in RD_LANG_SET SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
     if [ -n "${!v-}" ]; then
       if [ "$v" = "RD_LANG_SET" ]; then envs+="export RD_LANG=$(printf '%q' "${!v}"); "
       else envs+="export $v=$(printf '%q' "${!v}"); "; fi
@@ -682,8 +683,14 @@ system_tray = disabled
 EOF
   fi
   printf '%s:%s\n' "$SUN_USER" "$SUN_PASS" > "$BASE/sunshine.cred"; chmod 600 "$BASE/sunshine.cred"
+  : > "$LOG/sunshine-creds.log"
   sunshine --creds "$SUN_USER" "$SUN_PASS" >> "$LOG/sunshine-creds.log" 2>&1 \
-    || E "Không đặt được tài khoản Sunshine (xem $LOG/sunshine-creds.log)" "Could not set the Sunshine account (see $LOG/sunshine-creds.log)"
+    || {
+      E "Không đặt được tài khoản Sunshine (xem $LOG/sunshine-creds.log)" "Could not set the Sunshine account (see $LOG/sunshine-creds.log)"
+      tail -n 8 "$LOG/sunshine-creds.log" 2>/dev/null | cut -c1-170
+      ldd "$(command -v sunshine)" 2>/dev/null | grep 'not found' \
+        && E "Sunshine thiếu thư viện ở trên. Thử: sudo apt-get install -f" "Sunshine is missing the libraries above. Try: sudo apt-get install -f"
+    }
 }
 
 # Chuẩn bị cấu hình + script khởi động (nhẹ, không compositor)
@@ -829,6 +836,25 @@ svc_stop() {
 }
 
 # ---------------------------------------------------------------------
+# Chờ Sunshine mở cổng ghép cặp (47989); nếu không thì in luôn lý do để khỏi phải dò tay
+check_sunshine() {
+  local n="${SUNSHINE_WAIT:-45}" i
+  L "Kiểm tra Sunshine đã sẵn sàng (tối đa ${n}s)..." "Checking that Sunshine is ready (up to ${n}s)..."
+  for i in $(seq 1 "$n"); do
+    if curl -s -m 2 -o /dev/null "http://127.0.0.1:47989/serverinfo"; then
+      L "Sunshine đã sẵn sàng." "Sunshine is ready."; return 0
+    fi
+    sleep 1
+  done
+  E "Sunshine KHÔNG trả lời ở cổng 47989 - Moonlight Web sẽ báo 'Host is not reachable'." \
+    "Sunshine is NOT answering on port 47989 - Moonlight Web will say 'Host is not reachable'."
+  echo "--- sunshine-creds.log ---"; tail -n 8 "$LOG/sunshine-creds.log" 2>/dev/null | cut -c1-170
+  echo "--- sunshine.log ---";       tail -n 15 "$LOG/sunshine.log" 2>/dev/null | cut -c1-170
+  echo "--- xvfb-events ---";        tail -n 6 "$LOG/xvfb-events.log" 2>/dev/null | cut -c1-150
+  echo "--- $(t "thư viện thiếu" "missing libraries") ---"; ldd "$(command -v sunshine)" 2>/dev/null | grep 'not found' || echo "$(t "(không)" "(none)")"
+  return 1
+}
+
 start_all() {
   command -v sunshine >/dev/null || { E "Chưa cài Sunshine. Chạy: $0 install" "Sunshine is not installed. Run: $0 install"; exit 1; }
   [ -x "$BASE/moonlight/web-server" ] || { E "Chưa cài Moonlight Web. Chạy: $0 install" "Moonlight Web is not installed. Run: $0 install"; exit 1; }
@@ -869,6 +895,7 @@ start_all() {
       grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG/cloudflared.log" && break; sleep 1
     done
   fi
+  check_sunshine
   show_url
 }
 
