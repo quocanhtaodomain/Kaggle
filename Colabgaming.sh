@@ -6,7 +6,7 @@
 #   + thư viện GPU NVIDIA (Tesla T4) qua EGL / VirtualGL
 #
 # Dùng:  ./Colabgaming.sh user | install | install-stream | install-gpu | install-apps
-#                         | start | stop | restart | status | url | pin <PIN> | gpu | logs [service]
+#                         | setup | start | stop | restart | status | url | pin <PIN> | gpu | logs [service]
 #
 # Nếu chạy bằng root, script tự tạo user có quyền sudo (mặc định "remote"),
 # rồi tự chuyển sang user đó để chạy lệnh (install, start, ...).
@@ -25,6 +25,8 @@
 #   WEB_PORT           cổng Moonlight Web trên localhost (mặc định 6080; tránh 8080 vì Colab dùng)
 #   SUNSHINE_USER      tài khoản web UI của Sunshine (mặc định: sunshine)
 #   SUNSHINE_PASSWORD  mật khẩu web UI của Sunshine (mặc định: quocanhh; lưu lại cho lần sau)
+#   MOONLIGHT_USER     tài khoản admin Moonlight Web tự tạo khi start (mặc định: admin)
+#   MOONLIGHT_PASSWORD mật khẩu của nó (mặc định: quocanhh; NÊN ĐỔI vì URL công khai; lưu lại cho lần sau)
 #   SUNSHINE_WAIT      số giây chờ Sunshine sẵn sàng khi start (mặc định 45)
 #   SUNSHINE_VERSION   tag Sunshine, ví dụ v2026.914.233613 (mặc định: bản mới nhất; dùng bản AppImage)
 #   MOONLIGHT_VERSION  tag Moonlight Web, ví dụ v3.0.2 (mặc định: bản mới nhất)
@@ -130,7 +132,7 @@ reexec_as_user() {
 
   # Giữ lại các biến cấu hình và PATH (Colab có nvidia-smi ở thư mục riêng)
   envs="export PATH=$(printf '%q' "$PATH"):\$PATH; "
-  for v in RD_LANG_SET MOONLIGHT_TRANSPORT TURN_URL TURN_USERNAME TURN_CREDENTIAL SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
+  for v in RD_LANG_SET MOONLIGHT_USER MOONLIGHT_PASSWORD MOONLIGHT_TRANSPORT TURN_URL TURN_USERNAME TURN_CREDENTIAL SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
     if [ -n "${!v-}" ]; then
       if [ "$v" = "RD_LANG_SET" ]; then envs+="export RD_LANG=$(printf '%q' "${!v}"); "
       else envs+="export $v=$(printf '%q' "${!v}"); "; fi
@@ -147,7 +149,7 @@ reexec_as_user() {
 
 # Chạy bằng root -> tự tạo user và chuyển sang (trừ lệnh 'user' và khi RD_AS_ROOT=1)
 case "${1:-}" in
-  install|install-stream|install-gpu|install-apps|start|stop|restart|status|url|pin|gpu|logs)
+  install|install-stream|install-gpu|install-apps|setup|start|stop|restart|status|url|pin|gpu|logs)
     if [ "$(id -u)" -eq 0 ] && [ "${RD_AS_ROOT:-0}" != "1" ]; then
       reexec_as_user "$@"
     fi
@@ -174,6 +176,15 @@ if { [ -z "$SUN_USER" ] || [ -z "$SUN_PASS" ]; } && [ -r "$BASE/sunshine.cred" ]
   [ -n "$SUN_PASS" ] || SUN_PASS="${_saved#*:}"
 fi
 SUN_USER="${SUN_USER:-sunshine}"; SUN_PASS="${SUN_PASS:-quocanhh}"
+
+# Tài khoản admin Moonlight Web: dùng giá trị đặt lần này, nếu không thì giá trị đã lưu, mặc định admin / quocanhh
+MOON_USER="${MOONLIGHT_USER:-}"; MOON_PASS="${MOONLIGHT_PASSWORD:-}"
+if { [ -z "$MOON_USER" ] || [ -z "$MOON_PASS" ]; } && [ -r "$BASE/moonlight.cred" ]; then
+  _msaved="$(cat "$BASE/moonlight.cred" 2>/dev/null)"
+  [ -n "$MOON_USER" ] || MOON_USER="${_msaved%%:*}"
+  [ -n "$MOON_PASS" ] || MOON_PASS="${_msaved#*:}"
+fi
+MOON_USER="${MOON_USER:-admin}"; MOON_PASS="${MOON_PASS:-quocanhh}"
 
 # run "<mô tả>" <lệnh...>  -> ẩn output, ghi vào install.log; lỗi thì in đoạn cuối log
 run() {
@@ -889,6 +900,184 @@ check_conflict() {
 }
 
 # ---------------------------------------------------------------------
+# Tự thiết lập Moonlight Web: tạo tài khoản admin, thêm PC "127.0.0.1" (KHÔNG dùng "localhost": thư viện
+# stream có thể phân giải thành IPv6 ::1 trong khi Sunshine chỉ nghe IPv4 -> "Connection refused"),
+# rồi tự ghép cặp (PIN do Moonlight Web sinh ra được gửi thẳng vào Sunshine).
+moonlight_setup() {
+  command -v python3 >/dev/null 2>&1 || { E "Không có python3, bỏ qua tự thiết lập." "python3 not found, skipping auto-setup."; return 1; }
+  L "Tự thiết lập Moonlight Web (tài khoản + ghép cặp PC 127.0.0.1)..." "Auto-configuring Moonlight Web (account + pairing PC 127.0.0.1)..."
+
+  cat > "$BIN/moonlight-setup.py" <<'PYEOF'
+import sys, json, time, ssl, base64, threading
+import urllib.request, urllib.parse, urllib.error, http.cookiejar
+
+port, mu, mp, su, sp = sys.argv[1:6]
+BASE = "http://127.0.0.1:%s/api" % port
+SUN = "https://127.0.0.1:47990/api/pin"
+cj = http.cookiejar.CookieJar()
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+ctx = ssl._create_unverified_context()
+
+
+def call(method, path, body=None, query=None, timeout=30):
+    url = BASE + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    return op.open(urllib.request.Request(url, data=data, method=method, headers=headers), timeout=timeout)
+
+
+def sun(method, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    h = {"Authorization": "Basic " + base64.b64encode(("%s:%s" % (su, sp)).encode()).decode()}
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    r = urllib.request.urlopen(urllib.request.Request(SUN, data=data, method=method, headers=h), timeout=15, context=ctx)
+    return json.loads(r.read().decode() or "{}")
+
+
+def done(code, msg=""):
+    print("RESULT:%s:%s" % (code, msg))
+    sys.exit(0)
+
+
+# 1) đăng nhập (lần đầu tiên sẽ tạo tài khoản admin)
+ok = False
+for _ in range(40):
+    try:
+        call("POST", "/login", {"name": mu, "password": mp}).read()
+        ok = True
+        break
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403, 404):
+            done("login_failed")
+        time.sleep(1)
+    except Exception:
+        time.sleep(1)
+if not ok:
+    done("unreachable")
+
+
+def list_hosts():
+    r = call("GET", "/hosts")
+    first = r.readline().decode().strip()
+    r.close()
+    try:
+        return json.loads(first).get("hosts", [])
+    except Exception:
+        return []
+
+
+def host_info(hid):
+    return json.loads(call("GET", "/host", query={"host_id": hid}).read().decode()).get("host", {})
+
+
+# 2) tìm PC 127.0.0.1; xóa PC "localhost" cũ (dễ gây lỗi Connection refused)
+target = None
+for h in list_hosts():
+    try:
+        info = host_info(h["host_id"])
+    except Exception:
+        continue
+    addr = info.get("address", "")
+    if addr == "127.0.0.1":
+        target = info
+    elif addr in ("localhost", "::1"):
+        try:
+            call("DELETE", "/host", query={"host_id": h["host_id"]}).read()
+        except Exception:
+            pass
+
+# 3) thêm PC nếu chưa có
+if target is None:
+    try:
+        target = json.loads(call("POST", "/host", {"address": "127.0.0.1", "http_port": None}).read().decode()).get("host")
+    except Exception as e:
+        done("host_failed", str(e))
+if not target:
+    done("host_failed", "no host returned")
+if target.get("paired") == "Paired":
+    done("ok", "already_paired")
+
+# 4) ghép cặp: Moonlight Web trả về PIN, ta nhập PIN vào Sunshine qua API
+result = {}
+
+
+def reader():
+    try:
+        r = call("POST", "/pair", {"host_id": target["host_id"]}, timeout=120)
+        for raw in r:
+            line = raw.decode().strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if "Pin" in obj:
+                result["pin"] = obj["Pin"]
+            elif "Paired" in obj:
+                result["paired"] = True
+                return
+            else:
+                result["other"] = line[:160]
+    except Exception as e:
+        result["err"] = str(e)
+
+
+th = threading.Thread(target=reader, daemon=True)
+th.start()
+t0 = time.time()
+while "pin" not in result and "err" not in result and time.time() - t0 < 30:
+    time.sleep(0.3)
+if "pin" not in result:
+    done("pair_failed", result.get("err", result.get("other", "no PIN")))
+
+pid = None
+for _ in range(40):
+    try:
+        lst = sun("GET").get("pairings", [])
+        if lst:
+            pid = lst[0].get("id")
+            break
+    except Exception:
+        pass
+    time.sleep(0.5)
+if not pid:
+    done("pair_failed", "Sunshine has no pending pairing")
+res = sun("POST", {"pairing_id": pid, "pin": result["pin"], "name": "moonlight-web"})
+th.join(timeout=30)
+if result.get("paired"):
+    done("ok", "paired")
+done("pair_failed", str(result.get("err", res)))
+PYEOF
+
+  local out code detail
+  rm -f "$BASE/setup.ok"
+  out="$(python3 "$BIN/moonlight-setup.py" "$WEB_PORT" "$MOON_USER" "$MOON_PASS" "$SUN_USER" "$SUN_PASS" 2>&1)"
+  code="$(printf '%s\n' "$out" | grep '^RESULT:' | tail -n1 | cut -d: -f2)"
+  detail="$(printf '%s\n' "$out" | grep '^RESULT:' | tail -n1 | cut -d: -f3-)"
+  case "$code" in
+    ok)
+      printf '%s:%s\n' "$MOON_USER" "$MOON_PASS" > "$BASE/moonlight.cred"; chmod 600 "$BASE/moonlight.cred"
+      : > "$BASE/setup.ok"
+      L "Moonlight Web đã sẵn sàng: tài khoản '$MOON_USER', PC 127.0.0.1 đã ghép cặp." \
+        "Moonlight Web is ready: account '$MOON_USER', PC 127.0.0.1 is paired."
+      return 0 ;;
+    login_failed)
+      E "Moonlight Web đã có tài khoản khác (mật khẩu không khớp '$MOON_USER'). Đăng nhập bằng tài khoản của bạn rồi làm tay (xem hướng dẫn bên dưới), hoặc đặt MOONLIGHT_USER/MOONLIGHT_PASSWORD đúng." \
+        "Moonlight Web already has a different account (password does not match '$MOON_USER'). Sign in with your own account and follow the manual steps below, or set MOONLIGHT_USER/MOONLIGHT_PASSWORD correctly." ;;
+    unreachable)
+      E "Không kết nối được Moonlight Web ở cổng $WEB_PORT (xem: $0 logs moonlight)." "Cannot reach Moonlight Web on port $WEB_PORT (see: $0 logs moonlight)." ;;
+    host_failed)
+      E "Không thêm được PC 127.0.0.1: $detail" "Could not add PC 127.0.0.1: $detail" ;;
+    pair_failed)
+      E "Ghép cặp tự động thất bại: $detail" "Automatic pairing failed: $detail" ;;
+    *)
+      E "Tự thiết lập lỗi không rõ:" "Auto-setup failed for an unknown reason:"; printf '%s\n' "$out" | tail -n 6 ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------------
 # Chờ Sunshine mở cổng ghép cặp (47989); nếu không thì in luôn lý do để khỏi phải dò tay
 check_sunshine() {
   local n="${SUNSHINE_WAIT:-45}" i
@@ -955,7 +1144,7 @@ start_all() {
       grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG/cloudflared.log" && break; sleep 1
     done
   fi
-  check_sunshine
+  if check_sunshine; then moonlight_setup || true; fi
   show_url
 }
 
@@ -984,28 +1173,55 @@ show_url() {
     echo "URL : $(t "(chưa có - xem: $0 logs cloudflared)" "(not ready - see: $0 logs cloudflared)")"
   fi
   echo "------------------------------------------------------------"
+  local auto=0; [ -f "$BASE/setup.ok" ] && auto=1
   if [ "$RD_LANG" = "vi" ]; then
-    cat <<EOF
-Lần đầu dùng:
- 1) Mở URL, tạo tài khoản đầu tiên (người đầu tiên sẽ là admin - hãy làm ngay).
- 2) Thêm PC (nút +): địa chỉ 127.0.0.1, để trống cổng.
- 3) Bấm vào PC để Pair -> trang hiện mã PIN -> chạy:  $0 pin <PIN>
- 4) Data Transport đã được đặt sẵn = Web Socket (Cloudflare Tunnel không chuyển UDP của WebRTC).
+    if [ "$auto" = 1 ]; then
+      cat <<EOF
+Cách dùng:
+ 1) Mở URL và đăng nhập Moonlight Web:  $MOON_USER / $MOON_PASS
+    (tài khoản và PC 127.0.0.1 đã được tự tạo và ghép cặp)
+ 2) Bấm vào PC "Colabgaming" -> Launch -> Desktop để xem màn hình.
+ 3) Data Transport đã đặt sẵn = Web Socket (Cloudflare Tunnel không chuyển UDP của WebRTC).
     Nếu vẫn thấy lỗi WebRTC: Settings > Data Transport > Web Socket, rồi Ctrl+F5 để xóa cache trang.
+ 4) URL công khai: hãy đổi mật khẩu mặc định bằng MOONLIGHT_PASSWORD / SUNSHINE_PASSWORD.
+Tài khoản web UI Sunshine (chỉ truy cập được trong máy): $SUN_USER / $SUN_PASS
+EOF
+    else
+      cat <<EOF
+Chưa tự thiết lập xong Moonlight Web (xem thông báo phía trên). Làm tay:
+ 1) Mở URL, tạo tài khoản đầu tiên (người đầu tiên sẽ là admin - hãy làm ngay).
+ 2) Thêm PC (nút +): địa chỉ 127.0.0.1 (KHÔNG dùng 'localhost'), để trống cổng.
+    Nếu đã có PC tên 'localhost' thì xóa nó đi.
+ 3) Bấm vào PC để Pair -> trang hiện mã PIN -> chạy:  $0 pin <PIN>     (hoặc thử lại tự động:  $0 setup)
+ 4) Data Transport đã đặt sẵn = Web Socket. Nếu vẫn lỗi WebRTC: Settings > Data Transport > Web Socket, rồi Ctrl+F5.
  5) Bấm Launch / Desktop để xem màn hình.
 Tài khoản web UI Sunshine (chỉ truy cập được trong máy): $SUN_USER / $SUN_PASS
 EOF
+    fi
   else
-    cat <<EOF
-First time:
- 1) Open the URL and create the first account (the first user becomes admin - do it right away).
- 2) Add a PC (+ button): address 127.0.0.1, leave the port empty.
- 3) Click the PC to Pair -> the page shows a PIN -> run:  $0 pin <PIN>
- 4) Data Transport is already preset to Web Socket (a Cloudflare Tunnel does not carry WebRTC's UDP).
+    if [ "$auto" = 1 ]; then
+      cat <<EOF
+How to use:
+ 1) Open the URL and sign in to Moonlight Web:  $MOON_USER / $MOON_PASS
+    (the account and the PC 127.0.0.1 were created and paired automatically)
+ 2) Click the PC "Colabgaming" -> Launch -> Desktop to see the screen.
+ 3) Data Transport is already preset to Web Socket (a Cloudflare Tunnel does not carry WebRTC's UDP).
     If you still see a WebRTC error: Settings > Data Transport > Web Socket, then Ctrl+F5 to clear the page cache.
+ 4) The URL is public: change the default passwords with MOONLIGHT_PASSWORD / SUNSHINE_PASSWORD.
+Sunshine web UI account (reachable inside the machine only): $SUN_USER / $SUN_PASS
+EOF
+    else
+      cat <<EOF
+Moonlight Web auto-setup did not finish (see the message above). Do it by hand:
+ 1) Open the URL and create the first account (the first user becomes admin - do it right away).
+ 2) Add a PC (+ button): address 127.0.0.1 (do NOT use 'localhost'), leave the port empty.
+    If a PC named 'localhost' already exists, delete it.
+ 3) Click the PC to Pair -> the page shows a PIN -> run:  $0 pin <PIN>     (or retry automatically:  $0 setup)
+ 4) Data Transport is already preset to Web Socket. If you still see a WebRTC error: Settings > Data Transport > Web Socket, then Ctrl+F5.
  5) Click Launch / Desktop to see the screen.
 Sunshine web UI account (reachable inside the machine only): $SUN_USER / $SUN_PASS
 EOF
+    fi
   fi
 }
 
@@ -1059,8 +1275,9 @@ case "${1:-}" in
   restart)        stop_all; sleep 1; start_all ;;
   status)         status ;;
   url)            show_url ;;
+  setup)          moonlight_setup ;;
   pin)            pin_cmd "${2:-}" "${3:-}" ;;
   gpu)            gpu_check ;;
   logs)           tail -n 50 -f "$LOG/${2:-sunshine}.log" ;;
-  *) echo "$(t "Dùng" "Usage"): $0 {user|install|install-stream|install-gpu|install-apps|start|stop|restart|status|url|pin <PIN>|gpu|logs [sunshine|moonlight|desktop|cloudflared|xvfb|xvfb-events]}"; exit 1 ;;
+  *) echo "$(t "Dùng" "Usage"): $0 {user|install|install-stream|install-gpu|install-apps|setup|start|stop|restart|status|url|pin <PIN>|gpu|logs [sunshine|moonlight|desktop|cloudflared|xvfb|xvfb-events]}"; exit 1 ;;
 esac
