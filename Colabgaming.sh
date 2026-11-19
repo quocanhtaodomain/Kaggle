@@ -251,10 +251,50 @@ install_all() {
 
 # ---------------------------------------------------------------------
 # Sunshine + Moonlight Web
+# Thư viện hệ thống mà Sunshine AppImage không đóng gói sẵn (libpipewire, libgbm, ...).
+# Chạy được nhiều lần: kiểm tra bằng ldd, thiếu thư viện nào thì cài đúng gói tương ứng.
+# Luôn được gọi (cả khi AppImage "đã có") vì lần cài trước có thể bị ngắt trước khi cài thư viện.
+ensure_sunshine_libs() {
+  local bin="$SUN_DIR/usr/bin/sunshine" missing lib p pkgs
+  [ -x "$bin" ] || return 0
+  missing="$(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}')"
+  [ -n "$missing" ] || return 0
+  L "      Sunshine thiếu thư viện hệ thống: $(echo $missing) - đang cài..." \
+    "      Sunshine is missing system libraries: $(echo $missing) - installing..."
+  $SUDO $APT update -qq >> "$INSTALL_LOG" 2>&1 || true
+  for lib in $missing; do
+    case "$lib" in
+      libpipewire-0.3.so*)   pkgs="libpipewire-0.3-0t64 libpipewire-0.3-0" ;;
+      libgbm.so*)            pkgs="libgbm1" ;;
+      libdrm.so*)            pkgs="libdrm2" ;;
+      libwayland-client.so*) pkgs="libwayland-client0" ;;
+      libX11.so*)            pkgs="libx11-6" ;;
+      libasound.so*)         pkgs="libasound2t64 libasound2" ;;
+      *)                     pkgs="" ;;
+    esac
+    for p in $pkgs; do
+      echo "=== apt install $p (cho $lib) ===" >> "$INSTALL_LOG"
+      if $SUDO $APT install -y --no-install-recommends "$p" >> "$INSTALL_LOG" 2>&1; then break; fi
+    done
+  done
+  $SUDO ldconfig >/dev/null 2>&1
+  missing="$(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}')"
+  if [ -n "$missing" ]; then
+    E "Sunshine VẪN thiếu thư viện: $(echo $missing)" "Sunshine is STILL missing libraries: $(echo $missing)"
+    echo "--- apt ($INSTALL_LOG) ---"
+    grep -E '^E:|Unable to locate|has no installation candidate|Err:' "$INSTALL_LOG" 2>/dev/null | tail -n 8
+    return 1
+  fi
+  L "      Đã cài đủ thư viện cho Sunshine." "      All libraries for Sunshine are installed."
+  return 0
+}
+
 install_sunshine() {
   local dir="$BASE/sunshine" arch tag assets ai p
   if [ -x "$SUN_BIN" ]; then
-    L "      Sunshine (AppImage) đã có." "      Sunshine (AppImage) already installed."; return 0
+    L "      Sunshine (AppImage) đã có." "      Sunshine (AppImage) already installed."
+    ensure_sunshine_libs || true      # bắt buộc kiểm tra: lần cài trước có thể bị ngắt giữa chừng
+    return 0
   fi
   case "$(uname -m)" in x86_64) arch=x86_64 ;; aarch64|arm64) arch=aarch64 ;; *) E "Sunshine: arch không hỗ trợ" "Sunshine: unsupported architecture"; return 1 ;; esac
 
@@ -277,15 +317,8 @@ install_sunshine() {
   ( cd "$dir" && R "      Giải nén Sunshine AppImage" "      Extracting the Sunshine AppImage" ./Sunshine.AppImage --appimage-extract ) || return 1
   rm -f "$dir/Sunshine.AppImage"
 
-  # AppImage đã đóng gói gần hết thư viện; chỉ còn vài thư viện hệ thống cần có sẵn (cài từng gói, gói nào không có thì bỏ qua)
-  L "      Cài thư viện hệ thống còn thiếu cho Sunshine" "      Installing the remaining system libraries for Sunshine"
-  for p in libx11-6 libdrm2 libgbm1 libwayland-client0 libpipewire-0.3-0t64 libpipewire-0.3-0; do
-    $SUDO $APT install -y --no-install-recommends "$p" >> "$INSTALL_LOG" 2>&1 || true
-  done
-  if ldd "$SUN_DIR/usr/bin/sunshine" 2>/dev/null | grep -q 'not found'; then
-    E "Sunshine vẫn thiếu thư viện:" "Sunshine is still missing libraries:"
-    ldd "$SUN_DIR/usr/bin/sunshine" 2>/dev/null | grep 'not found'
-  fi
+  # AppImage đã đóng gói gần hết thư viện; chỉ còn vài thư viện hệ thống cần có sẵn
+  ensure_sunshine_libs || true
 }
 
 install_moonlight() {
@@ -1105,6 +1138,7 @@ start_all() {
     || { E "Chưa cài Openbox/lxpanel. Chạy: $0 install" "Openbox/lxpanel are not installed. Run: $0 install"; exit 1; }
   command -v cloudflared >/dev/null || { E "Chưa cài cloudflared. Chạy: $0 install" "cloudflared is not installed. Run: $0 install"; exit 1; }
   check_conflict || exit 1
+  ensure_sunshine_libs || { E "Không start được vì Sunshine thiếu thư viện (xem ở trên)." "Cannot start: Sunshine is missing libraries (see above)."; exit 1; }
   prepare_config
 
   # Thư mục socket X phải cho phép mọi user tạo file; dọn lock cũ (kể cả của root)
