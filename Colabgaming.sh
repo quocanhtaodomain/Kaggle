@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =====================================================================
 # Colabgaming - desktop game-streaming trong container (không systemd)
-#   Sunshine AppImage (server stream) + Moonlight Web (xem trong trình duyệt)
+#   Sunshine (gói .deb, server stream) + Moonlight Web (xem trong trình duyệt)
 #   + Xvfb + Openbox + LXDE panel (lxpanel) + Cloudflare Tunnel
 #   + thư viện GPU NVIDIA (Tesla T4) qua EGL / VirtualGL
 #
@@ -27,8 +27,12 @@
 #   SUNSHINE_PASSWORD  mật khẩu web UI của Sunshine (mặc định: quocanhh; lưu lại cho lần sau)
 #   MOONLIGHT_USER     tài khoản admin Moonlight Web tự tạo khi start (mặc định: admin)
 #   MOONLIGHT_PASSWORD mật khẩu của nó (mặc định: quocanhh; NÊN ĐỔI vì URL công khai; lưu lại cho lần sau)
+#   APT_MIRROR         ép dùng một mirror apt, ví dụ https://mirrors.edge.kernel.org/ubuntu/ (mặc định: tự dò khi
+#                      archive.ubuntu.com không tới được, như trên Kaggle); đặt APT_MIRROR=skip để không đụng vào apt
 #   SUNSHINE_WAIT      số giây chờ Sunshine sẵn sàng khi start (mặc định 45)
-#   SUNSHINE_VERSION   tag Sunshine, ví dụ v2026.914.233613 (mặc định: bản mới nhất; dùng bản AppImage)
+#   SUNSHINE_VERSION   tag Sunshine, ví dụ v2026.914.233613 (mặc định: bản mới nhất)
+#   SUNSHINE_DEB_FLAVOR  bản .deb dùng cho Ubuntu nào: ubuntu22.04 (mặc định) hoặc ubuntu24.04
+#   SUNSHINE_DEB_URL   ép dùng đúng link .deb này (bỏ qua SUNSHINE_VERSION / SUNSHINE_DEB_FLAVOR)
 #   MOONLIGHT_VERSION  tag Moonlight Web, ví dụ v3.0.2 (mặc định: bản mới nhất)
 #   MOONLIGHT_TRANSPORT  Data Transport mặc định của Moonlight Web: websocket (mặc định, hợp Cloudflare) hoặc auto
 #   TURN_URL / TURN_USERNAME / TURN_CREDENTIAL   (tùy chọn) TURN server cho WebRTC, ví dụ TURN_URL=turn:host:443?transport=tcp
@@ -132,7 +136,7 @@ reexec_as_user() {
 
   # Giữ lại các biến cấu hình và PATH (Colab có nvidia-smi ở thư mục riêng)
   envs="export PATH=$(printf '%q' "$PATH"):\$PATH; "
-  for v in RD_LANG_SET MOONLIGHT_USER MOONLIGHT_PASSWORD MOONLIGHT_TRANSPORT TURN_URL TURN_USERNAME TURN_CREDENTIAL SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
+  for v in RD_LANG_SET SUNSHINE_DEB_URL SUNSHINE_DEB_FLAVOR APT_MIRROR MOONLIGHT_USER MOONLIGHT_PASSWORD MOONLIGHT_TRANSPORT TURN_URL TURN_USERNAME TURN_CREDENTIAL SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
     if [ -n "${!v-}" ]; then
       if [ "$v" = "RD_LANG_SET" ]; then envs+="export RD_LANG=$(printf '%q' "${!v}"); "
       else envs+="export $v=$(printf '%q' "${!v}"); "; fi
@@ -163,10 +167,10 @@ mkdir -p "$RUN" "$LOG" "$BIN"
 INSTALL_LOG="$LOG/install.log"
 
 SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo"
-# Sunshine AppImage đã giải nén: chạy bằng AppRun (AppRun tự cd vào thư mục của nó rồi mới chạy sunshine)
-SUN_DIR="$BASE/sunshine/squashfs-root"
-SUN_BIN="$SUN_DIR/AppRun"
-APT="env DEBIAN_FRONTEND=noninteractive apt-get"
+# Sunshine cài bằng gói .deb -> chương trình nằm ở /usr/bin/sunshine
+SUN_BIN="/usr/bin/sunshine"
+# Timeout ngắn + thử lại ít: nếu kho apt không tới được thì báo lỗi nhanh thay vì treo hàng chục phút
+APT="env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
 
 # Tài khoản web UI của Sunshine: dùng giá trị đặt lần này, nếu không thì giá trị đã lưu, mặc định sunshine / quocanhh
 SUN_USER="${SUNSHINE_USER:-}"; SUN_PASS="${SUNSHINE_PASSWORD:-}"
@@ -204,11 +208,67 @@ run() {
 R() { local m; m="$(t "$1" "$2")"; shift 2; run "$m" "$@"; }
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Một số nền tảng (ví dụ Kaggle) không tới được archive.ubuntu.com / security.ubuntu.com: apt treo rất lâu rồi
+# không tải được gói nào. Hàm này kiểm tra nhanh, nếu không tới được thì dò một mirror khác tới được và
+# chuyển các nguồn apt của Ubuntu sang mirror đó (sao lưu file gốc thành *.colabgaming.bak).
+setup_apt_mirror() {
+  [ "${APT_MIRROR:-}" = "skip" ] && return 0
+  [ -f /etc/apt/colabgaming.mirror ] && [ -z "${APT_MIRROR:-}" ] && return 0
+  local codename cand ok="" f
+  codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-noble}")"
+
+  # Kho mặc định có tới được không? Thử 3 lần (một lần mạng chậm không đủ để kết luận là bị chặn)
+  if [ -z "${APT_MIRROR:-}" ]; then
+    local try
+    for try in 1 2 3; do
+      if curl -fsS -m 8 -o /dev/null "http://archive.ubuntu.com/ubuntu/dists/$codename/InRelease" 2>/dev/null; then
+        return 0                               # kho mặc định tới được, không cần đổi
+      fi
+      sleep 1
+    done
+  fi
+
+  L "      Không tới được archive.ubuntu.com, đang dò mirror apt khác..." \
+    "      archive.ubuntu.com is unreachable, probing another apt mirror..."
+  local candidates=(
+    ${APT_MIRROR:+"$APT_MIRROR"}
+    "http://us-central1.gce.archive.ubuntu.com/ubuntu/"
+    "https://mirrors.edge.kernel.org/ubuntu/"
+    "https://mirror.us.leaseweb.net/ubuntu/"
+    "https://mirrors.xtom.com/ubuntu/"
+    "https://ftp.halifax.rwth-aachen.de/ubuntu/"
+    "https://mirrors.ustc.edu.cn/ubuntu/"
+    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"
+    "https://ftp.sjtu.edu.cn/ubuntu/"
+  )
+  for cand in "${candidates[@]}"; do
+    cand="${cand%/}/"
+    if curl -fsS -m 8 -o /dev/null "${cand}dists/${codename}/InRelease" 2>/dev/null; then ok="$cand"; break; fi
+  done
+  if [ -z "$ok" ]; then
+    E "Không tìm được mirror apt nào tới được. Thử đặt APT_MIRROR=<địa chỉ mirror Ubuntu tới được từ máy này>." \
+      "No reachable apt mirror found. Try setting APT_MIRROR=<an Ubuntu mirror reachable from this machine>."
+    return 1
+  fi
+
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+    [ -f "$f" ] || continue
+    grep -qE 'ubuntu\.com/ubuntu' "$f" || continue
+    [ -f "$f.colabgaming.bak" ] || $SUDO cp -p "$f" "$f.colabgaming.bak"
+    $SUDO sed -i -E "s#https?://([a-z0-9.-]+\.)?(archive|security)\.ubuntu\.com/ubuntu/?#${ok}#g" "$f"
+  done
+  echo "$ok" | $SUDO tee /etc/apt/colabgaming.mirror >/dev/null
+  L "      Dùng mirror apt: $ok" "      Using apt mirror: $ok"
+  return 0
+}
+
 install_all() {
   : > "$INSTALL_LOG"
   L "Log cài đặt: $INSTALL_LOG (đặt VERBOSE=1 nếu muốn xem trực tiếp)" \
     "Install log: $INSTALL_LOG (set VERBOSE=1 to see it live)"
 
+  setup_apt_mirror || exit 1
   R "[1/6] Cập nhật danh sách gói" "[1/6] Updating package lists" $SUDO $APT update -qq || exit 1
   R "[2/6] Cài Xvfb, Openbox, LXDE panel, PulseAudio và công cụ" \
     "[2/6] Installing Xvfb, Openbox, LXDE panel, PulseAudio and tools" \
@@ -251,16 +311,17 @@ install_all() {
 
 # ---------------------------------------------------------------------
 # Sunshine + Moonlight Web
-# Thư viện hệ thống mà Sunshine AppImage không đóng gói sẵn (libpipewire, libgbm, ...).
+# Thư viện hệ thống mà Sunshine cần (libpipewire, libgbm, ...) nhưng chưa có trên máy.
 # Chạy được nhiều lần: kiểm tra bằng ldd, thiếu thư viện nào thì cài đúng gói tương ứng.
-# Luôn được gọi (cả khi AppImage "đã có") vì lần cài trước có thể bị ngắt trước khi cài thư viện.
+# Luôn được gọi (cả khi Sunshine "đã có") vì lần cài trước có thể bị ngắt giữa chừng.
 ensure_sunshine_libs() {
-  local bin="$SUN_DIR/usr/bin/sunshine" missing lib p pkgs
+  local bin="$SUN_BIN" missing lib p pkgs
   [ -x "$bin" ] || return 0
   missing="$(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}')"
   [ -n "$missing" ] || return 0
   L "      Sunshine thiếu thư viện hệ thống: $(echo $missing) - đang cài..." \
     "      Sunshine is missing system libraries: $(echo $missing) - installing..."
+  setup_apt_mirror || true
   $SUDO $APT update -qq >> "$INSTALL_LOG" 2>&1 || true
   for lib in $missing; do
     case "$lib" in
@@ -290,34 +351,43 @@ ensure_sunshine_libs() {
 }
 
 install_sunshine() {
-  local dir="$BASE/sunshine" arch tag assets ai p
+  local arch tag ver flavor url assets debname
   if [ -x "$SUN_BIN" ]; then
-    L "      Sunshine (AppImage) đã có." "      Sunshine (AppImage) already installed."
+    L "      Sunshine đã có." "      Sunshine already installed."
     ensure_sunshine_libs || true      # bắt buộc kiểm tra: lần cài trước có thể bị ngắt giữa chừng
     return 0
   fi
-  case "$(uname -m)" in x86_64) arch=x86_64 ;; aarch64|arm64) arch=aarch64 ;; *) E "Sunshine: arch không hỗ trợ" "Sunshine: unsupported architecture"; return 1 ;; esac
+  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) E "Sunshine: arch không hỗ trợ" "Sunshine: unsupported architecture"; return 1 ;; esac
 
-  tag="${SUNSHINE_VERSION:-}"
-  if [ -z "$tag" ]; then
-    tag="$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/LizardByte/Sunshine/releases/latest)"
-    tag="${tag##*/}"
+  url="${SUNSHINE_DEB_URL:-}"
+  if [ -z "$url" ]; then
+    flavor="${SUNSHINE_DEB_FLAVOR:-ubuntu22.04}"
+    tag="${SUNSHINE_VERSION:-}"
+    if [ -z "$tag" ]; then
+      tag="$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/SunshineStream/Sunshine/releases/latest)"
+      tag="${tag##*/}"
+    fi
+    [ -n "$tag" ] || { E "Không xác định được phiên bản Sunshine." "Could not determine the Sunshine version."; return 1; }
+    ver="${tag#v}"
+    # Ưu tiên tên file thật trong danh sách release; nếu không đọc được thì dựng theo mẫu tên chuẩn
+    assets="$(curl -fsSL "https://github.com/SunshineStream/Sunshine/releases/expanded_assets/$tag" 2>/dev/null)"
+    debname="$(printf '%s' "$assets" | grep -oE "download/[^\"]+/sunshine_[^\"]*${flavor}_${arch}\.deb" | head -n1)"
+    if [ -n "$debname" ]; then
+      url="https://github.com/SunshineStream/Sunshine/releases/$debname"
+    else
+      url="https://github.com/SunshineStream/Sunshine/releases/download/${tag}/sunshine_${ver}-1+${flavor}_${arch}.deb"
+    fi
   fi
-  [ -n "$tag" ] || { E "Không xác định được phiên bản Sunshine." "Could not determine the Sunshine version."; return 1; }
 
-  assets="$(curl -fsSL "https://github.com/LizardByte/Sunshine/releases/expanded_assets/$tag" 2>/dev/null)"
-  ai="$(printf '%s' "$assets" | grep -oE "download/[^\"]+Sunshine_[0-9.]+_${arch}\.AppImage" | head -n1)"
-  [ -n "$ai" ] || { E "Không tìm thấy file AppImage của Sunshine ($tag)." "Could not find a Sunshine AppImage ($tag)."; return 1; }
-
-  mkdir -p "$dir"
-  R "      Tải Sunshine AppImage ($tag)" "      Downloading Sunshine AppImage ($tag)" \
-    curl -fsSL -o "$dir/Sunshine.AppImage" "https://github.com/LizardByte/Sunshine/releases/$ai" || return 1
-  chmod +x "$dir/Sunshine.AppImage"
-  # Container không có FUSE -> giải nén AppImage rồi chạy AppRun trong thư mục đã giải nén
-  ( cd "$dir" && R "      Giải nén Sunshine AppImage" "      Extracting the Sunshine AppImage" ./Sunshine.AppImage --appimage-extract ) || return 1
-  rm -f "$dir/Sunshine.AppImage"
-
-  # AppImage đã đóng gói gần hết thư viện; chỉ còn vài thư viện hệ thống cần có sẵn
+  R "      Tải Sunshine (.deb)" "      Downloading Sunshine (.deb)" curl -fsSL -o /tmp/sunshine.deb "$url" \
+    || { E "Không tải được: $url" "Could not download: $url"; return 1; }
+  # apt cài kèm các thư viện phụ thuộc; nếu apt lỗi (kho apt không tới được) thì cài thẳng bằng dpkg rồi bù thư viện sau
+  if ! R "      Cài Sunshine (kèm thư viện phụ thuộc, hơi lâu)" "      Installing Sunshine (with dependencies, takes a while)" \
+       $SUDO $APT install -y /tmp/sunshine.deb; then
+    E "apt cài Sunshine lỗi, thử dpkg trực tiếp rồi bù thư viện..." "apt failed to install Sunshine, trying dpkg directly and fixing libraries afterwards..."
+    R "      dpkg -i Sunshine" "      dpkg -i Sunshine" $SUDO dpkg -i --force-depends /tmp/sunshine.deb || { rm -f /tmp/sunshine.deb; return 1; }
+  fi
+  rm -f /tmp/sunshine.deb
   ensure_sunshine_libs || true
 }
 
@@ -459,6 +529,7 @@ install_polymc() {
 }
 
 install_apps() {
+  setup_apt_mirror || true
   install_java     || E "Java 25: lỗi (xem $INSTALL_LOG)" "Java 25: failed (see $INSTALL_LOG)"
   install_chromium || E "Chromium: lỗi (xem $INSTALL_LOG)" "Chromium: failed (see $INSTALL_LOG)"
   install_polymc   || E "PolyMC: lỗi (xem $INSTALL_LOG)" "PolyMC: failed (see $INSTALL_LOG)"
@@ -510,6 +581,7 @@ EOF
 
 install_gpu() {
   make_gpurun
+  setup_apt_mirror || true
   local NVSMI="$BIN/nvidia-smi"
   if ! "$NVSMI" -L >/dev/null 2>&1; then
     E "Không phát hiện GPU NVIDIA (nvidia-smi không chạy được) - bỏ qua phần GPU." \
@@ -762,7 +834,7 @@ EOF
     || {
       E "Không đặt được tài khoản Sunshine (xem $LOG/sunshine-creds.log)" "Could not set the Sunshine account (see $LOG/sunshine-creds.log)"
       tail -n 8 "$LOG/sunshine-creds.log" 2>/dev/null | cut -c1-170
-      ldd "$SUN_DIR/usr/bin/sunshine" 2>/dev/null | grep 'not found' \
+      ldd "$SUN_BIN" 2>/dev/null | grep 'not found' \
         && E "Sunshine thiếu thư viện ở trên. Chạy lại: $0 install-stream" "Sunshine is missing the libraries above. Run again: $0 install-stream"
     }
 }
@@ -1126,12 +1198,12 @@ check_sunshine() {
   echo "--- sunshine-creds.log ---"; tail -n 8 "$LOG/sunshine-creds.log" 2>/dev/null | cut -c1-170
   echo "--- sunshine.log ---";       tail -n 15 "$LOG/sunshine.log" 2>/dev/null | cut -c1-170
   echo "--- xvfb-events ---";        tail -n 6 "$LOG/xvfb-events.log" 2>/dev/null | cut -c1-150
-  echo "--- $(t "thư viện thiếu" "missing libraries") ---"; ldd "$SUN_DIR/usr/bin/sunshine" 2>/dev/null | grep 'not found' || echo "$(t "(không)" "(none)")"
+  echo "--- $(t "thư viện thiếu" "missing libraries") ---"; ldd "$SUN_BIN" 2>/dev/null | grep 'not found' || echo "$(t "(không)" "(none)")"
   return 1
 }
 
 start_all() {
-  [ -x "$SUN_BIN" ] || { E "Chưa cài Sunshine (AppImage). Chạy: $0 install" "Sunshine (AppImage) is not installed. Run: $0 install"; exit 1; }
+  [ -x "$SUN_BIN" ] || { E "Chưa cài Sunshine. Chạy: $0 install" "Sunshine is not installed. Run: $0 install"; exit 1; }
   [ -x "$BASE/moonlight/web-server" ] || { E "Chưa cài Moonlight Web. Chạy: $0 install" "Moonlight Web is not installed. Run: $0 install"; exit 1; }
   command -v Xvfb >/dev/null || { E "Chưa cài Xvfb. Chạy: $0 install" "Xvfb is not installed. Run: $0 install"; exit 1; }
   command -v openbox >/dev/null && command -v lxpanel >/dev/null \
