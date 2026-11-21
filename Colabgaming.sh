@@ -21,7 +21,9 @@
 #   RD_USER_PASSWORD   mật khẩu của user đó (mặc định: quocanhh)
 #   RD_AS_ROOT=1       không chuyển user, chạy thẳng bằng root
 #   VERBOSE=1          hiện toàn bộ log cài đặt (mặc định ẩn, ghi vào ~/.remote-desktop/log/install.log)
-#   RESOLUTION         độ phân giải màn hình ảo (mặc định 1920x1080)
+#   RESOLUTION         độ phân giải màn hình ảo VÀ của stream (mặc định 1280x720; 1920x1080 tốn CPU gấp ~2,25 lần)
+#   STREAM_FPS         FPS stream mặc định trong Moonlight Web (mặc định 30; 60 tốn CPU gấp đôi)
+#   STREAM_BITRATE     bitrate mặc định (kbps) trong Moonlight Web (mặc định 6000; thấp hơn thì nhẹ cho đường truyền/cloudflared)
 #   WEB_PORT           cổng Moonlight Web trên localhost (mặc định 6080; tránh 8080 vì Colab dùng)
 #   SUNSHINE_USER      tài khoản web UI của Sunshine (mặc định: sunshine)
 #   SUNSHINE_PASSWORD  mật khẩu web UI của Sunshine (mặc định: quocanhh; lưu lại cho lần sau)
@@ -31,6 +33,8 @@
 #                      archive.ubuntu.com không tới được, như trên Kaggle); đặt APT_MIRROR=skip để không đụng vào apt
 #   SUNSHINE_WAIT      số giây chờ Sunshine sẵn sàng khi start (mặc định 45)
 #   SUNSHINE_VERSION   tag Sunshine, ví dụ v2026.914.233613 (mặc định: bản mới nhất)
+#   SUNSHINE_CODECS    h264 (mặc định: Sunshine chỉ quảng cáo H.264, tránh lỗi "VideoDecoder ... Decoding error" khi
+#                      trình duyệt nhận H.265/AV1) hoặc all (cho phép cả H.265 và AV1)
 #   SUNSHINE_DEB_FLAVOR  bản .deb dùng cho Ubuntu nào: ubuntu22.04 (mặc định) hoặc ubuntu24.04
 #   SUNSHINE_DEB_URL   ép dùng đúng link .deb này (bỏ qua SUNSHINE_VERSION / SUNSHINE_DEB_FLAVOR)
 #   MOONLIGHT_VERSION  tag Moonlight Web, ví dụ v3.0.2 (mặc định: bản mới nhất)
@@ -48,12 +52,12 @@
 set -u
 
 DISP_NUM=20            # màn hình ảo :20
-RESOLUTION="${RESOLUTION:-1920x1080}"
+RESOLUTION="${RESOLUTION:-1280x720}"
 WEB_PORT="${WEB_PORT:-6080}"
 CF_TOKEN="${CF_TOKEN:-}"
 CF_PROTOCOL="${CF_PROTOCOL:-http2}"
 VERBOSE="${VERBOSE:-0}"
-RD_USER="${RD_USER:-remote}"
+RD_USER="${RD_USER:-Quahnah}"
 RD_USER_PASSWORD="${RD_USER_PASSWORD:-quocanhh}"
 
 # ---------------------------------------------------------------------
@@ -136,7 +140,7 @@ reexec_as_user() {
 
   # Giữ lại các biến cấu hình và PATH (Colab có nvidia-smi ở thư mục riêng)
   envs="export PATH=$(printf '%q' "$PATH"):\$PATH; "
-  for v in RD_LANG_SET SUNSHINE_DEB_URL SUNSHINE_DEB_FLAVOR APT_MIRROR MOONLIGHT_USER MOONLIGHT_PASSWORD MOONLIGHT_TRANSPORT TURN_URL TURN_USERNAME TURN_CREDENTIAL SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
+  for v in RD_LANG_SET STREAM_FPS STREAM_BITRATE SUNSHINE_CODECS SUNSHINE_DEB_URL SUNSHINE_DEB_FLAVOR APT_MIRROR MOONLIGHT_USER MOONLIGHT_PASSWORD MOONLIGHT_TRANSPORT TURN_URL TURN_USERNAME TURN_CREDENTIAL SUNSHINE_WAIT CF_PROTOCOL WEB_PORT RESOLUTION SUNSHINE_USER SUNSHINE_PASSWORD SUNSHINE_VERSION MOONLIGHT_VERSION CF_TOKEN VGL_VERSION POLYMC_VERSION SKIP_APPS VERBOSE; do
     if [ -n "${!v-}" ]; then
       if [ "$v" = "RD_LANG_SET" ]; then envs+="export RD_LANG=$(printf '%q' "${!v}"); "
       else envs+="export $v=$(printf '%q' "${!v}"); "; fi
@@ -427,6 +431,21 @@ patch_moonlight_ui() {
     fi
   done
   [ "$n" -gt 0 ] && L "Moonlight Web: Data Transport mặc định = $want ($n file)" "Moonlight Web: default Data Transport = $want ($n files)"
+
+  # Mặc định stream của giao diện là 1080p / 60 FPS / 10 Mbps (rất nặng với máy ít CPU): đặt lại cho nhẹ hơn.
+  # Độ phân giải stream nên bằng độ phân giải màn hình ảo (RESOLUTION) để Sunshine khỏi phải co giãn ảnh.
+  local rw rh fps br m=0
+  if [[ "${RESOLUTION:-1366x768}" =~ ^([0-9]+)x([0-9]+)$ ]]; then rw="${BASH_REMATCH[1]}"; rh="${BASH_REMATCH[2]}"; else rw=1280; rh=720; fi
+  fps="${STREAM_FPS:-60}"; br="${STREAM_BITRATE:-10000}"
+  [[ "$fps" =~ ^[0-9]+$ ]] || fps=30
+  [[ "$br" =~ ^[0-9]+$ ]] || br=6000
+  for f in "$sd"/*.js; do
+    [ -f "$f" ] || continue
+    if grep -qE 'bitrate:[0-9e.]+,fps:[0-9]+,videoSize:"custom",videoSizeCustom:\{width:[0-9]+,height:[0-9]+\}' "$f"; then
+      sed -i -E "s/bitrate:[0-9e.]+,fps:[0-9]+,videoSize:\"custom\",videoSizeCustom:\{width:[0-9]+,height:[0-9]+\}/bitrate:${br},fps:${fps},videoSize:\"custom\",videoSizeCustom:{width:${rw},height:${rh}}/g" "$f" && m=$((m+1))
+    fi
+  done
+  [ "$m" -gt 0 ] && L "Moonlight Web: stream mặc định ${rw}x${rh} @ ${fps} FPS, ${br} kbps" "Moonlight Web: default stream ${rw}x${rh} @ ${fps} FPS, ${br} kbps"
   return 0
 }
 
@@ -819,14 +838,24 @@ write_sunshine_config() {
   mkdir -p "$d"
   # Chỉ ghi đè khi file do script tạo (có dòng "colabgaming")
   if [ ! -f "$d/sunshine.conf" ] || grep -q 'colabgaming' "$d/sunshine.conf"; then
-    cat > "$d/sunshine.conf" <<'EOF'
+    {
+      cat <<'EOF'
 # colabgaming: auto-generated on every start; delete this line to edit by hand
 sunshine_name = Colabgaming
 capture = x11
 address_family = ipv4
 origin_web_ui_allowed = pc
 system_tray = disabled
+sw_preset = ultrafast
+sw_tune = zerolatency
 EOF
+      if [ "${SUNSHINE_CODECS:-h264}" != "all" ]; then
+        # Chỉ quảng cáo H.264: nếu quảng cáo cả H.265/AV1, trình duyệt có thể chọn chúng rồi báo
+        # "VideoDecoder has an error EncodingError: Decoding error" (hay gặp khi GPU nén được HEVC bằng NVENC)
+        echo 'hevc_mode = 1'
+        echo 'av1_mode = 1'
+      fi
+    } > "$d/sunshine.conf"
   fi
   printf '%s:%s\n' "$SUN_USER" "$SUN_PASS" > "$BASE/sunshine.cred"; chmod 600 "$BASE/sunshine.cred"
   : > "$LOG/sunshine-creds.log"
@@ -900,9 +929,10 @@ fi
 spid=$!
 trap 'kill "$spid" "$xpid" 2>/dev/null' TERM INT
 
-why=""; up=0; fails=0
+why=""; up=0; fails=0; tick=0
 while :; do
   sleep 1
+  tick=$((tick+1))
   if ! alive "$xpid"; then
     wait "$xpid" 2>/dev/null; code=$?
     why="Xvfb exited, code $code (134=X server abort, 139=segfault, 137=SIGKILL/OOM, 135=SIGBUS)"
@@ -913,6 +943,7 @@ while :; do
     why="Sunshine exited, code $code"
     break
   fi
+  [ $((tick % 5)) -eq 0 ] || continue      # kiểm tra phản hồi X mỗi 5 giây (rẻ hơn nhiều so với mỗi giây)
   if DISPLAY=":$D" timeout 5 xset q >/dev/null 2>&1; then
     up=1; fails=0
   elif [ "$up" = 1 ]; then
